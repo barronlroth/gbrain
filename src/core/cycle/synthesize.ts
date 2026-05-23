@@ -26,14 +26,16 @@
  *   - Daily token budget cap (cooldown bounds spend at v1 scale).
  */
 
-import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
+import { chat, type ChatResult } from '../ai/gateway.ts';
 import { MinionQueue } from '../minions/queue.ts';
+import { MinionWorker } from '../minions/worker.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
 import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
+import { makeSubagentHandler } from '../minions/handlers/subagent.ts';
 import { discoverTranscripts, type DiscoveredTranscript } from './transcript-discovery.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
@@ -293,10 +295,10 @@ export async function runPhaseSynthesize(
       return ok('no transcripts to process', { transcripts_processed: 0, pages_written: 0 });
     }
 
-    // Significance verdicts (cached in dream_verdicts; Haiku on miss).
+    // Significance verdicts (cached in dream_verdicts; utility model on miss).
     const worthProcessing: DiscoveredTranscript[] = [];
     const verdicts: Array<{ filePath: string; worth: boolean; reasons: string[]; cached: boolean }> = [];
-    const haiku = makeHaikuClient(); // null if no API key
+    const judgeClient = makeVerdictClient();
     for (const t of transcripts) {
       const cached = await engine.getDreamVerdict(t.filePath, t.contentHash);
       if (cached) {
@@ -304,12 +306,15 @@ export async function runPhaseSynthesize(
         if (cached.worth_processing) worthProcessing.push(t);
         continue;
       }
-      if (!haiku) {
-        // No API key — can't judge. Skip with explicit reason; don't crash phase.
-        verdicts.push({ filePath: t.filePath, worth: false, reasons: ['no ANTHROPIC_API_KEY for significance judge'], cached: false });
+      let verdict: VerdictResult;
+      try {
+        verdict = await judgeSignificance(judgeClient, t, config.verdictModel);
+      } catch (e) {
+        // Provider unavailable or misconfigured — skip with explicit reason; don't crash phase.
+        const reason = e instanceof Error && e.message ? e.message : String(e);
+        verdicts.push({ filePath: t.filePath, worth: false, reasons: [`significance judge unavailable: ${reason}`], cached: false });
         continue;
       }
-      const verdict = await judgeSignificance(haiku, t, config.verdictModel);
       await engine.putDreamVerdict(t.filePath, t.contentHash, verdict);
       verdicts.push({ filePath: t.filePath, worth: verdict.worth_processing, reasons: verdict.reasons, cached: false });
       if (verdict.worth_processing) worthProcessing.push(t);
@@ -425,6 +430,34 @@ export async function runPhaseSynthesize(
         if (isChunked) {
           chunkInfo.set(child.id, { idx: i, hash6 });
         }
+      }
+    }
+
+    // PGLite cannot run a separate `gbrain jobs work` process because its
+    // exclusive file lock blocks other processes. Dream cycles still need the
+    // submitted subagent jobs to execute, so drain these children inline in
+    // this process before the ordinary terminal-state collection below.
+    if (engine.kind === 'pglite' && childIds.length > 0) {
+      const worker = new MinionWorker(engine, {
+        queue: 'default',
+        pollInterval: 100,
+        healthCheckInterval: 0,
+      });
+      worker.register('subagent', makeSubagentHandler({ engine }));
+      const workerPromise = worker.start();
+      try {
+        for (const jobId of childIds) {
+          await waitForCompletion(queue, jobId, {
+            timeoutMs: 35 * 60 * 1000,
+            pollMs: 250,
+          });
+          if (opts.yieldDuringPhase) {
+            try { await opts.yieldDuringPhase(); } catch { /* best-effort */ }
+          }
+        }
+      } finally {
+        worker.stop();
+        await workerPromise;
       }
     }
 
@@ -633,21 +666,45 @@ async function loadAllowedSlugPrefixes(): Promise<string[]> {
   return [];
 }
 
-// ── Significance judge (Haiku) ───────────────────────────────────────
+// ── Significance judge (gateway utility model) ────────────────────────
 
 export interface JudgeClient {
-  create: (params: Anthropic.MessageCreateParamsNonStreaming) => Promise<Anthropic.Message>;
+  create: (params: {
+    model: string;
+    max_tokens: number;
+    system: string;
+    messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
+  }) => Promise<ChatResult | { content?: Array<{ type?: string; text?: string }> }>;
 }
 
-function makeHaikuClient(): JudgeClient | null {
-  if (!process.env.ANTHROPIC_API_KEY) return null;
-  const client = new Anthropic();
-  return { create: client.messages.create.bind(client.messages) };
+function ensureGatewayModel(model: string): string {
+  return model.includes(':') ? model : `anthropic:${model}`;
+}
+
+function makeVerdictClient(): JudgeClient {
+  return {
+    create: (params) => chat({
+      model: ensureGatewayModel(params.model),
+      system: params.system,
+      messages: params.messages.map(m => ({ role: m.role, content: m.content })),
+      maxTokens: params.max_tokens,
+    }),
+  };
 }
 
 interface VerdictResult {
   worth_processing: boolean;
   reasons: string[];
+}
+
+function extractJudgeText(msg: ChatResult | { content?: Array<{ type?: string; text?: string }> }): string {
+  if ('text' in msg && typeof msg.text === 'string') return msg.text;
+  const content = (msg as { content?: Array<{ type?: string; text?: string }> }).content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n');
 }
 
 export async function judgeSignificance(
@@ -686,20 +743,17 @@ Two reasons max, one phrase each.`;
     messages: [{ role: 'user', content: `Transcript ${t.basename}:\n\n${trimmed}` }],
   });
 
-  for (const block of msg.content) {
-    if (block.type === 'text') {
-      const text = block.text.trim();
-      const m = /\{[\s\S]*\}/.exec(text);
-      if (!m) continue;
-      try {
-        const parsed = JSON.parse(m[0]) as { worth_processing?: unknown; reasons?: unknown };
-        const worth = parsed.worth_processing === true;
-        const reasons = Array.isArray(parsed.reasons)
-          ? parsed.reasons.filter((r): r is string => typeof r === 'string').slice(0, 4)
-          : [];
-        return { worth_processing: worth, reasons };
-      } catch { /* fall through */ }
-    }
+  const text = extractJudgeText(msg).trim();
+  const m = /\{[\s\S]*\}/.exec(text);
+  if (m) {
+    try {
+      const parsed = JSON.parse(m[0]) as { worth_processing?: unknown; reasons?: unknown };
+      const worth = parsed.worth_processing === true;
+      const reasons = Array.isArray(parsed.reasons)
+        ? parsed.reasons.filter((r): r is string => typeof r === 'string').slice(0, 4)
+        : [];
+      return { worth_processing: worth, reasons };
+    } catch { /* fall through */ }
   }
   // Couldn't parse — default to NOT processing (cheap fallback).
   return { worth_processing: false, reasons: ['judge response unparseable'] };
