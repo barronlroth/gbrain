@@ -203,6 +203,13 @@ async function main() {
     console.error(e instanceof Error ? e.message : String(e));
     process.exit(1);
   } finally {
+    // Hotfix for local PGLite + Bun: after some read-only operations (`get`,
+    // `search`, `query`) PGLite's close path can spin forever after output has
+    // already rendered. For one-shot read commands, let process exit release
+    // the OS lock instead of entering the problematic close path.
+    if (['get', 'search', 'query'].includes(command)) {
+      return;
+    }
     await engine.disconnect();
   }
 }
@@ -1768,7 +1775,13 @@ Run gbrain <command> --help for command-specific help.
 `);
 }
 
-main().catch(e => {
+main().then(() => {
+  // Ensure one-shot CLI invocations terminate even if a provider/DB dependency
+  // leaves a non-critical handle alive after command completion. Long-running
+  // commands (`serve`, `autopilot`, `sync --watch`, `jobs work`) do not return
+  // until they are meant to stop, so this does not cut them off mid-run.
+  process.exit(0);
+}).catch(e => {
   console.error(e.message || e);
   process.exit(1);
 });
