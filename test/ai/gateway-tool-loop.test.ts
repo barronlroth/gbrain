@@ -139,15 +139,20 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
       onToolCallComplete: async (gbrainToolUseId, _output) => {
         events.push(`onToolCallComplete(${gbrainToolUseId})`);
       },
+      onToolResultTurn: async (turnIdx, messageIdx, blocks) => {
+        events.push(`onToolResultTurn(turn=${turnIdx}, msg=${messageIdx}, blocks=${blocks.length})`);
+      },
     });
 
     // Write-ordering invariant: assistant persisted BEFORE pending tool row;
-    // pending row persisted BEFORE execute; execute BEFORE complete.
+    // pending row persisted BEFORE execute; execute BEFORE complete; synthetic
+    // tool-result turn persisted BEFORE the next provider call/assistant turn.
     expect(events[0]).toBe('onAssistantTurn(0)');
     expect(events[1]).toMatch(/onToolCallStart\(turn=0, ordinal=0, name=echo/);
     expect(events[2]).toMatch(/execute/);
     expect(events[3]).toMatch(/onToolCallComplete\(gb-0-0\)/);
-    expect(events[4]).toBe('onAssistantTurn(1)'); // final assistant turn
+    expect(events[4]).toMatch(/onToolResultTurn\(turn=0, msg=1, blocks=1\)/);
+    expect(events[5]).toBe('onAssistantTurn(1)'); // final assistant turn
   });
 
   it('replay short-circuits a complete prior tool execution', async () => {

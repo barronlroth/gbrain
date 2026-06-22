@@ -2927,6 +2927,8 @@ export interface ToolLoopOpts {
   ) => Promise<{ gbrainToolUseId: string }>;
   onToolCallComplete?: (gbrainToolUseId: string, output: unknown) => Promise<void>;
   onToolCallFailed?: (gbrainToolUseId: string, error: string) => Promise<void>;
+  /** Persist the synthetic tool-result turn before the next provider call. */
+  onToolResultTurn?: (turnIdx: number, messageIdx: number, blocks: ChatBlock[]) => Promise<void>;
 
   /** Optional per-call heartbeat for observability. */
   onHeartbeat?: (event: string, data: Record<string, unknown>) => void;
@@ -3150,9 +3152,12 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
 
     if (stopReason === 'aborted') break;
 
-    // Feed all tool results back as a single user message.
+    // Feed all tool results back as a single user message. Persist this
+    // synthetic turn before the next provider call so a failure/retry after
+    // tool execution resumes with a complete assistant-tool-call → tool-result
+    // history instead of triggering provider "missing tool results" errors.
     const userMessageIdx = messageIdx++;
-    void userMessageIdx;
+    await opts.onToolResultTurn?.(turnIdx, userMessageIdx, toolResultBlocks);
     messages.push({ role: 'user', content: toolResultBlocks });
 
     turnIdx++;

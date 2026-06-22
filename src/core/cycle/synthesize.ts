@@ -18,7 +18,7 @@
  *   - Cooldown via `dream.synthesize.last_completion_ts` config key —
  *     written ONLY on success (codex finding #5 deferral: no auto git commit
  *     in v1).
- *   - Idempotency via `dream:synth:<file_path>:<content_hash>` job key.
+ *   - Idempotency via `dream:synth:v2:<model>:<file_path>:<content_hash>` job key.
  *   - Edited transcripts produce slugs with content-hash suffix → no overwrite.
  *
  * NOT in v1:
@@ -75,6 +75,16 @@ const MIN_PROMPT_TOKENS = 100_000;
 const DEFAULT_MAX_CHUNKS = 24;
 /** Conservative default budget when model is unknown (200K × HEADROOM_RATIO). */
 const UNKNOWN_MODEL_BUDGET_TOKENS = 180_000;
+/**
+ * Dream child job idempotency namespace.
+ *
+ * v1 keyed only on transcript path + content hash, which meant a terminal dead
+ * child from an older broken provider/schema path permanently poisoned future
+ * synthesize runs for the same transcript. v2 includes the resolved synthesis
+ * model so a fixed/changed provider gets a fresh durable attempt while repeated
+ * runs on the same still-broken model remain idempotent and visibly terminal.
+ */
+const DREAM_SYNTH_CHILD_IDEMPOTENCY_VERSION = 'v2';
 
 /**
  * Compute per-chunk character budget for the resolved model + config override.
@@ -113,6 +123,16 @@ function warnUnknownModelOnce(model: string): void {
     `using ${UNKNOWN_MODEL_BUDGET_TOKENS}-token fallback budget. ` +
     `Set dream.synthesize.max_prompt_tokens to override.\n`,
   );
+}
+
+export function buildDreamSynthesisIdempotencyKey(
+  filePath: string,
+  hash16: string,
+  model: string,
+  chunk?: { idx: number; total: number },
+): string {
+  const base = `dream:synth:${DREAM_SYNTH_CHILD_IDEMPOTENCY_VERSION}:${model}:${filePath}:${hash16}`;
+  return chunk ? `${base}:c${chunk.idx}of${chunk.total}` : base;
 }
 
 // ── Hash-deterministic transcript chunker (D9) ────────────────────────
@@ -469,14 +489,17 @@ export async function runPhaseSynthesize(
           allowed_slug_prefixes: allowedSlugPrefixes,
         };
         // Idempotency key parity:
-        //   - single-chunk → legacy `dream:synth:<filePath>:<hash16>` (byte-
-        //     equivalent across versions; preserves dedup for unchanged
-        //     transcripts on upgrade).
-        //   - multi-chunk → `<legacy>:c<i>of<n>` per chunk; durable across
-        //     runs because D9 splitTranscriptByBudget is hash-deterministic.
-        const idempotency_key = isChunked
-          ? `dream:synth:${t.filePath}:${hash16}:c${i}of${chunks.length}`
-          : `dream:synth:${t.filePath}:${hash16}`;
+        //   - v2 salts the key by resolved model/provider. This prevents old
+        //     terminal-dead jobs from a broken provider/schema path poisoning
+        //     a newer working provider for the same transcript hash.
+        //   - multi-chunk → `<base>:c<i>of<n>` per chunk; durable across runs
+        //     because D9 splitTranscriptByBudget is hash-deterministic.
+        const idempotency_key = buildDreamSynthesisIdempotencyKey(
+          t.filePath,
+          hash16,
+          subagentModel,
+          isChunked ? { idx: i, total: chunks.length } : undefined,
+        );
         const submitOpts: Partial<MinionJobInput> = {
           max_stalled: 3,
           on_child_fail: 'continue',

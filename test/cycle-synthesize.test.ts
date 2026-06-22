@@ -18,7 +18,12 @@ import {
   isDreamOutput,
   DREAM_OUTPUT_MARKER_RE,
 } from '../src/core/cycle/transcript-discovery.ts';
-import { judgeSignificance, renderPageToMarkdown, type JudgeClient } from '../src/core/cycle/synthesize.ts';
+import {
+  buildDreamSynthesisIdempotencyKey,
+  judgeSignificance,
+  renderPageToMarkdown,
+  type JudgeClient,
+} from '../src/core/cycle/synthesize.ts';
 
 let tmpDir: string;
 
@@ -30,6 +35,31 @@ function makeTranscript(name: string, body: string): string {
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), 'gbrain-synth-test-'));
+});
+
+describe('dream synthesis child idempotency keys', () => {
+  test('includes the namespace version and resolved model to avoid stale dead-job poisoning', () => {
+    const oldShape = 'dream:synth:/tmp/transcript.txt:abcdef1234567890';
+    const key = buildDreamSynthesisIdempotencyKey(
+      '/tmp/transcript.txt',
+      'abcdef1234567890',
+      'openai-codex:gpt-5.5',
+    );
+
+    expect(key).toBe('dream:synth:v2:openai-codex:gpt-5.5:/tmp/transcript.txt:abcdef1234567890');
+    expect(key).not.toBe(oldShape);
+  });
+
+  test('keeps chunk identity stable while salting by model', () => {
+    const key = buildDreamSynthesisIdempotencyKey(
+      '/tmp/transcript.txt',
+      'abcdef1234567890',
+      'anthropic:claude-sonnet-4-5',
+      { idx: 2, total: 5 },
+    );
+
+    expect(key).toBe('dream:synth:v2:anthropic:claude-sonnet-4-5:/tmp/transcript.txt:abcdef1234567890:c2of5');
+  });
 });
 
 describe('compileExcludePatterns', () => {

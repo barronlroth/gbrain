@@ -904,6 +904,18 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
         [errorMsg, gbrainToolUseId],
       );
     },
+    onToolResultTurn: async (_turnIdx, messageIdx, blocks) => {
+      await persistMessage(engine, ctx.id, {
+        message_idx: messageIdx,
+        role: 'user',
+        content_blocks: blocks as unknown as ContentBlock[],
+        tokens_in: null,
+        tokens_out: null,
+        tokens_cache_read: null,
+        tokens_cache_create: null,
+        model: null,
+      });
+    },
     onHeartbeat: heartbeat,
   });
 
