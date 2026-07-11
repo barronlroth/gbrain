@@ -212,6 +212,60 @@ describe('gateway.toolLoop (v0.38 D11 — provider-agnostic loop control)', () =
     expect((resultTurns[0].blocks[0] as Extract<ChatBlock, { type: 'tool-result' }>).toolCallId).toBe('tc1');
   });
 
+  it('normalizes structured tool output before completion and turn persistence callbacks', async () => {
+    let turn = 0;
+    __setChatTransportForTests(async () => {
+      turn++;
+      return turn === 1
+        ? {
+            text: '',
+            blocks: [{ type: 'tool-call', toolCallId: 'tc-safe', toolName: 'odd', input: {} }] as ChatBlock[],
+            stopReason: 'tool_calls',
+            usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+            model: 'anthropic:claude-sonnet-4-6',
+            providerId: 'anthropic',
+          }
+        : {
+            text: 'done',
+            blocks: [{ type: 'text', text: 'done' }] as ChatBlock[],
+            stopReason: 'end',
+            usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+            model: 'anthropic:claude-sonnet-4-6',
+            providerId: 'anthropic',
+          };
+    });
+
+    const circular: Record<string, unknown> = {
+      when: new Date('2026-08-16T12:00:00.000Z'),
+      count: 42n,
+      infinite: Infinity,
+      omitted: undefined,
+      array: [undefined, 7n],
+    };
+    circular.self = circular;
+    let completed: unknown;
+    let persisted: ChatBlock[] = [];
+    await toolLoop({
+      initialMessages: [{ role: 'user', content: 'go' }],
+      tools: [{ name: 'odd', description: 'odd output', inputSchema: { type: 'object' } }],
+      toolHandlers: new Map([['odd', { idempotent: true, async execute() { return circular; } }]]),
+      onToolCallStart: async () => ({ gbrainToolUseId: 'gb-safe' }),
+      onToolCallComplete: async (_id, output) => { completed = output; },
+      onToolResultTurn: async (_turn, _message, blocks) => { persisted = blocks; },
+    });
+
+    const expected = {
+      when: '2026-08-16T12:00:00.000Z',
+      count: '42',
+      infinite: null,
+      array: [null, '7'],
+      self: '[Circular]',
+    };
+    expect(completed).toEqual(expected);
+    expect((persisted[0] as Extract<ChatBlock, { type: 'tool-result' }>).output).toEqual(expected);
+    expect(() => JSON.stringify(completed)).not.toThrow();
+  });
+
   it('replay short-circuits a complete prior tool execution', async () => {
     let chatCalls = 0;
     __setChatTransportForTests(async () => {

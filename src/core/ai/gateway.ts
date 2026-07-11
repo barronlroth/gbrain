@@ -3178,23 +3178,40 @@ function defaultMaxOutputTokens(modelStr: string | undefined): number {
 
 /**
  * Deep-serialize a tool output into a plain JSON value for the AI SDK v6
- * ModelMessage schema. node-postgres returns `timestamptz` columns as JS
- * `Date` instances, and AI SDK v6's `JSONValue` schema rejects a raw Date,
- * throwing "Invalid prompt ... ModelMessage[] schema" the moment a
- * timestamp-bearing tool result (e.g. `brain_get_page`, `brain_list_pages`)
- * is fed back — dead-lettering the whole multi-tool loop. The JSON round-trip
- * runs `Date.prototype.toJSON` (ISO string) recursively and drops `undefined`.
- * This is a serialization fix at the SDK boundary, NOT a `::jsonb` DB cast —
- * it never touches Postgres. (BigInt / circular outputs still throw in
- * JSON.stringify; those aren't LLM-serializable and are out of scope.)
+ * ModelMessage schema. Preserves useful fields while normalizing values that
+ * strict JSON rejects: Date → ISO, BigInt → decimal string, non-finite numbers
+ * → null, unsupported object properties → omitted, unsupported array entries
+ * → null, and cycles → "[Circular]". The same conversion is used for durable
+ * persistence and the SDK boundary so replay cannot diverge from live turns.
+ * Apply this immediately after tool execution, before persistence callbacks
+ * as well as at the SDK boundary, so crash replay sees the same safe shape.
  */
-function toJsonSafe(value: unknown): unknown {
+export function normalizeToolOutput(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null) return null;
+  if (typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'bigint') return value.toString();
+  if (value === undefined || typeof value === 'function' || typeof value === 'symbol') return null;
+
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  if (typeof value !== 'object') return String(value);
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+
   try {
-    return JSON.parse(JSON.stringify(value ?? null));
+    if (Array.isArray(value)) {
+      return value.map(item => normalizeToolOutput(item, seen));
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      if (nested === undefined || typeof nested === 'function' || typeof nested === 'symbol') continue;
+      out[key] = normalizeToolOutput(nested, seen);
+    }
+    return out;
   } catch {
-    // BigInt / circular output isn't LLM-serializable; degrade to a string
-    // rather than throwing and dead-lettering the whole tool loop.
-    return safeStringify(value);
+    return String(value);
+  } finally {
+    seen.delete(value);
   }
 }
 
@@ -3243,7 +3260,7 @@ export function toModelMessages(messages: ChatMessage[]): unknown[] {
               ? { type: 'error-text' as const, value: safeStringify(b.output) }
               : (typeof b.output === 'string'
                 ? { type: 'text' as const, value: b.output }
-                : { type: 'json' as const, value: toJsonSafe(b.output) as never }),
+                : { type: 'json' as const, value: normalizeToolOutput(b.output) as never }),
             // #4201: echo per-part provider state (outbound name is providerOptions).
             ...(b.providerMetadata ? { providerOptions: b.providerMetadata } : {}),
           })),
@@ -4385,7 +4402,8 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
       // Step 3: execute (side effect).
       opts.onHeartbeat?.('tool_called', { turn_idx: turnIdx, tool_name: call.toolName });
       try {
-        const output = await handler.execute(call.input, opts.abortSignal ?? new AbortController().signal);
+        const rawOutput = await handler.execute(call.input, opts.abortSignal ?? new AbortController().signal);
+        const output = normalizeToolOutput(rawOutput);
         // Step 4: settle complete.
         await opts.onToolCallComplete?.(gbrainToolUseId, output);
         toolResultBlocks.push({

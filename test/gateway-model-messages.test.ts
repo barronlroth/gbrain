@@ -164,6 +164,31 @@ describe('toModelMessages — v6 ModelMessage shape', () => {
     expect(typeof out[0].content[0].output.value).toBe('string');
   });
 
+  test('tool-result json output preserves useful fields while normalizing non-JSON values', () => {
+    const circular: Record<string, unknown> = {
+      bigint: 42n,
+      notFinite: Number.POSITIVE_INFINITY,
+      when: new Date('2026-07-11T00:00:00.000Z'),
+      array: [undefined, 1n],
+    };
+    circular.self = circular;
+    const msgs: ChatMessage[] = [{
+      role: 'user',
+      content: [{ type: 'tool-result', toolCallId: 'c1', toolName: 'odd_values', output: circular }],
+    }];
+
+    expect((toModelMessages(msgs)[0] as any).content[0].output).toEqual({
+      type: 'json',
+      value: {
+        bigint: '42',
+        notFinite: null,
+        when: '2026-07-11T00:00:00.000Z',
+        array: [null, '1'],
+        self: '[Circular]',
+      },
+    });
+  });
+
   test('full multi-turn conversation: user → assistant(tool-call) → tool(result)', () => {
     const msgs: ChatMessage[] = [
       { role: 'user', content: 'find widget' },
