@@ -27,6 +27,10 @@ import {
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
 import { __resetFactsQueueForTests, getFactsQueue } from '../src/core/facts/queue.ts';
+import {
+  __resetShortLivedCliForTests,
+  markShortLivedCliProcess,
+} from '../src/core/facts/cli-process-mode.ts';
 
 let engine: PGLiteEngine;
 
@@ -44,6 +48,7 @@ afterEach(() => {
   __setChatTransportForTests(null);
   resetGateway();
   __resetFactsQueueForTests();
+  __resetShortLivedCliForTests();
 });
 
 const LONG_BODY = 'integration-test meeting note '.repeat(20);
@@ -188,6 +193,46 @@ describe('facts:absorb — multi-source isolation', () => {
 });
 
 describe('queue-mode → drains successfully on happy path', () => {
+  test('short-lived PGLite CLI runs inline instead of creating an unprocessable durable job', async () => {
+    const claim = 'pglite-inline-facts-' + Math.random().toString(36).slice(2, 10);
+    chatStub([{ fact: claim, kind: 'fact', notability: 'high', entity: null }]);
+    markShortLivedCliProcess();
+
+    const beforeJobs = await engine.executeRaw<{ n: string | number }>(
+      `SELECT COUNT(*) AS n FROM minion_jobs WHERE name = 'facts-absorb'`,
+    );
+    const r = await runFactsBackstop(
+      {
+        slug: 'meetings/pglite-inline-' + Math.random().toString(36).slice(2, 8),
+        type: 'meeting',
+        compiled_truth: LONG_BODY,
+        frontmatter: {},
+      },
+      {
+        engine,
+        sourceId: 'default',
+        sessionId: 'pglite-inline-session',
+        source: 'sync:import',
+        mode: 'queue',
+      },
+    );
+
+    expect(r).toEqual({ mode: 'queue', enqueued: true, queueDepth: 0 });
+    expect(getFactsQueue().pendingCount()).toBe(0);
+    expect(getFactsQueue().inflightCount()).toBe(0);
+
+    const afterJobs = await engine.executeRaw<{ n: string | number }>(
+      `SELECT COUNT(*) AS n FROM minion_jobs WHERE name = 'facts-absorb'`,
+    );
+    expect(Number(afterJobs[0]?.n ?? 0)).toBe(Number(beforeJobs[0]?.n ?? 0));
+
+    const facts = await engine.executeRaw<{ n: string | number }>(
+      `SELECT COUNT(*) AS n FROM facts WHERE fact = $1`,
+      [claim],
+    );
+    expect(Number(facts[0]?.n ?? 0)).toBe(1);
+  });
+
   test('queue worker completes; counters reflect work done', async () => {
     chatStub([{ fact: 'queue-drain-test', kind: 'fact', notability: 'medium', entity: null }]);
 

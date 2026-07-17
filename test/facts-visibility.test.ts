@@ -14,12 +14,16 @@ import {
   FACTS_DEFAULT_VISIBILITY_KEY,
 } from '../src/core/facts/visibility.ts';
 import { runFactsBackstop } from '../src/core/facts/backstop.ts';
-import { __setChatTransportForTests } from '../src/core/ai/gateway.ts';
 import {
   markShortLivedCliProcess,
   __resetShortLivedCliForTests,
 } from '../src/core/facts/cli-process-mode.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
+import {
+  __setChatTransportForTests,
+  resetGateway,
+  type ChatResult,
+} from '../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 
@@ -191,29 +195,35 @@ describe('ontology_propose visibility site (operations.ts ~:5812) [ENG-8]', () =
   });
 });
 
-describe('backstop minion-payload visibility site (backstop.ts queue mode) [ENG-8]', () => {
-  // The backstop gates on extraction availability before enqueueing; this
-  // block asserts the minion PAYLOAD, not availability — stub the chat
-  // transport so the gate passes regardless of shard env keys.
-  beforeAll(() => {
-    __setChatTransportForTests(async () => ({
-      text: '[]',
-      blocks: [{ type: 'text', text: '[]' }],
-      stopReason: 'end' as const,
-      usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
-      model: 'anthropic:claude-sonnet-4-6',
-      providerId: 'anthropic',
-    }));
-  });
-  afterAll(() => { __setChatTransportForTests(null); });
+describe('short-lived PGLite backstop visibility (inline queue-mode execution) [ENG-8]', () => {
   afterEach(async () => {
+    __setChatTransportForTests(null);
+    resetGateway();
     __resetShortLivedCliForTests();
     await engine.unsetConfig(FACTS_DEFAULT_VISIBILITY_KEY);
     await engine.executeRaw(`DELETE FROM minion_jobs WHERE name = 'facts-absorb'`).catch(() => {});
+    await engine.executeRaw(`DELETE FROM facts WHERE fact LIKE 'pglite-visibility-%'`).catch(() => {});
   });
 
-  async function submitAndReadPayload(slug: string, visibility?: 'private' | 'world') {
-    markShortLivedCliProcess(); // route queue mode through the durable minion job
+  async function submitAndReadVisibility(slug: string, visibility?: 'private' | 'world') {
+    const claim = `pglite-visibility-${slug}`;
+    __setChatTransportForTests(async (): Promise<ChatResult> => ({
+      text: JSON.stringify({
+        facts: [{
+          fact: claim,
+          kind: 'fact',
+          entity: null,
+          confidence: 1,
+          notability: 'high',
+        }],
+      }),
+      blocks: [],
+      stopReason: 'end',
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'test:stub',
+      providerId: 'test',
+    }));
+    markShortLivedCliProcess();
     const r = await runFactsBackstop(
       {
         slug,
@@ -232,28 +242,29 @@ describe('backstop minion-payload visibility site (backstop.ts queue mode) [ENG-
     );
     expect(r.mode).toBe('queue');
     expect((r as { enqueued: boolean }).enqueued).toBe(true);
-    const rows = await engine.executeRaw<{ data: unknown }>(
-      `SELECT data FROM minion_jobs WHERE name = 'facts-absorb'`,
+    const jobs = await engine.executeRaw<{ n: string | number }>(
+      `SELECT COUNT(*) AS n FROM minion_jobs WHERE name = 'facts-absorb'`,
     );
-    const payloads = rows.map((row) =>
-      (typeof row.data === 'string' ? JSON.parse(row.data) : row.data) as { slug: string; visibility: string },
+    expect(Number(jobs[0]?.n ?? 0)).toBe(0);
+    const rows = await engine.executeRaw<{ visibility: string }>(
+      `SELECT visibility FROM facts WHERE fact = $1`,
+      [claim],
     );
-    const mine = payloads.find((p) => p.slug === slug);
-    expect(mine).toBeDefined();
-    return mine!.visibility;
+    expect(rows).toHaveLength(1);
+    return rows[0].visibility;
   }
 
-  test('caller-unset visibility resolves the world config default at submit time', async () => {
+  test('caller-unset visibility resolves the world config default inline', async () => {
     await engine.setConfig(FACTS_DEFAULT_VISIBILITY_KEY, 'world');
-    expect(await submitAndReadPayload('wiki/notes/vis-default-world')).toBe('world');
+    expect(await submitAndReadVisibility('notes/vis-default-world')).toBe('world');
   });
 
   test('explicit private wins over a world config default', async () => {
     await engine.setConfig(FACTS_DEFAULT_VISIBILITY_KEY, 'world');
-    expect(await submitAndReadPayload('wiki/notes/vis-explicit-private', 'private')).toBe('private');
+    expect(await submitAndReadVisibility('notes/vis-explicit-private', 'private')).toBe('private');
   });
 
   test('caller-unset + no config → private (historic behavior preserved)', async () => {
-    expect(await submitAndReadPayload('wiki/notes/vis-floor')).toBe('private');
+    expect(await submitAndReadVisibility('notes/vis-floor')).toBe('private');
   });
 });

@@ -21,6 +21,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } fr
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import {
@@ -44,6 +45,7 @@ import {
 } from '../src/core/facts/absorb-log.ts';
 import { factsAbsorbShouldRetry } from '../src/commands/jobs.ts';
 import { markShortLivedCliProcess, __resetShortLivedCliForTests } from '../src/core/facts/cli-process-mode.ts';
+import { getFactsQueue } from '../src/core/facts/queue.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 let engine: PGLiteEngine;
@@ -69,6 +71,16 @@ async function absorbRows(): Promise<Array<{ summary: string }>> {
   return engine.executeRaw<{ summary: string }>(
     `SELECT summary FROM ingest_log WHERE source_type = 'facts:absorb' ORDER BY created_at`,
   );
+}
+
+function postgresKindEngine(): BrainEngine {
+  return new Proxy(engine, {
+    get(target, prop, receiver) {
+      if (prop === 'kind') return 'postgres';
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as unknown as BrainEngine;
 }
 
 beforeAll(async () => {
@@ -160,14 +172,27 @@ describe('keyless vs keyed chat_unavailable', () => {
     expect(stderrCapture).toContain('facts.extraction_model');
   });
 
-  test('pre-enqueue gate does NOT skip a servable DB-plane override (CX1 false-skip class)', async () => {
+  test('short-lived PGLite resolves a servable DB override and completes inline with no durable or in-process work', async () => {
     // Global default would be Anthropic (unservable), but the DB-plane
     // extraction override IS servable with the OpenAI key — the engine-aware
-    // gate must admit the work. Short-lived mode routes to the durable minion
-    // (no LLM call executes in-test) so we can also pin the retry policy.
+    // gate must admit the work. PGLite cannot hand work to a second process,
+    // so the queue-shaped caller waits for inline completion in the owning CLI.
     process.env.OPENAI_API_KEY = 'sk-test';
     await engine.setConfig('facts.extraction_model', 'openai:gpt-4o-mini');
     configureGateway({ env: { OPENAI_API_KEY: 'sk-test' } });
+    let calledModel: string | undefined;
+    __setChatTransportForTests(async (opts) => {
+      calledModel = opts.model;
+      return {
+        text: JSON.stringify({ facts: [{
+          fact: 'pglite inline override completed', kind: 'fact', entity: null,
+          confidence: 1, notability: 'high',
+        }] }),
+        blocks: [], stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: opts.model ?? 'openai:gpt-4o-mini', providerId: 'openai',
+      };
+    });
     markShortLivedCliProcess();
     const r = await runFactsBackstop(
       { slug: 'outcome-servable-override', type: 'note', compiled_truth: ELIGIBLE_BODY, frontmatter: {} },
@@ -176,13 +201,44 @@ describe('keyless vs keyed chat_unavailable', () => {
     expect(r.mode).toBe('queue');
     expect((r as { enqueued: boolean }).enqueued).toBe(true);
     expect((r as { skipped?: string }).skipped).toBeUndefined();
-    const jobs = await engine.executeRaw<{ max_attempts: number; backoff_delay: number }>(
-      `SELECT max_attempts, backoff_delay FROM minion_jobs WHERE name = 'facts-absorb'`,
+    expect(calledModel).toBe('openai:gpt-4o-mini');
+    const jobs = await engine.executeRaw<{ n: string | number }>(
+      `SELECT COUNT(*) AS n FROM minion_jobs WHERE name = 'facts-absorb'`,
     );
+    expect(Number(jobs[0]?.n ?? 0)).toBe(0);
+    expect(getFactsQueue().pendingCount()).toBe(0);
+    expect(getFactsQueue().inflightCount()).toBe(0);
+    const facts = await engine.executeRaw<{ n: string | number }>(
+      `SELECT COUNT(*) AS n FROM facts WHERE fact = 'pglite inline override completed'`,
+    );
+    expect(Number(facts[0]?.n ?? 0)).toBe(1);
+  });
+
+  test('short-lived non-PGLite keeps the durable payload, retry policy, and content key', async () => {
+    markShortLivedCliProcess();
+    const body = `${ELIGIBLE_BODY} durable-contract`;
+    const r = await runFactsBackstop(
+      { slug: 'outcome-durable-contract', type: 'note', compiled_truth: body, frontmatter: {} },
+      {
+        engine: postgresKindEngine(), sourceId: 'source-contract', sessionId: 'session-contract',
+        source: 'sync:import', mode: 'queue', notabilityFilter: 'high-only', visibility: 'world',
+        model: 'openai:gpt-4o-mini',
+      },
+    );
+    expect(r).toEqual({ mode: 'queue', enqueued: true, queueDepth: 0 });
+    const jobs = await engine.executeRaw<{
+      data: Record<string, unknown>; max_attempts: number; backoff_delay: number; idempotency_key: string;
+    }>(`SELECT data, max_attempts, backoff_delay, idempotency_key
+         FROM minion_jobs WHERE name = 'facts-absorb'`);
     expect(jobs).toHaveLength(1);
-    // Slow-retry policy (R2-5): config drift is fixed on human timescales.
     expect(Number(jobs[0].max_attempts)).toBe(5);
     expect(Number(jobs[0].backoff_delay)).toBe(60_000);
+    expect(jobs[0].data).toMatchObject({
+      slug: 'outcome-durable-contract', sourceId: 'source-contract', sessionId: 'session-contract',
+      source: 'sync:import', notabilityFilter: 'high-only', visibility: 'world', model: 'openai:gpt-4o-mini',
+    });
+    const hash = createHash('sha256').update(body).digest('hex').slice(0, 16);
+    expect(jobs[0].idempotency_key).toBe(`facts-absorb:source-contract:outcome-durable-contract:${hash}`);
   });
 });
 
@@ -328,12 +384,12 @@ describe('coverage-gap additions (ship review)', () => {
     expect((r as { inserted: number }).inserted).toBe(0);
   });
 
-  test('CRITICAL placement rule: keyless SUBMITTER still enqueues the durable job (worker may be keyed)', async () => {
+  test('CRITICAL placement rule: keyless non-PGLite SUBMITTER still enqueues the durable job (worker may be keyed)', async () => {
     configureGateway({ env: {} }); // keyless in the submitting process
     markShortLivedCliProcess();    // durable-submit lane
     const r = await runFactsBackstop(
       { slug: 'outcome-keyless-submit', type: 'note', compiled_truth: ELIGIBLE_BODY, frontmatter: {} },
-      { engine: engine as BrainEngine, sourceId: 'default', sessionId: null, source: 'mcp:put_page', mode: 'queue' },
+      { engine: postgresKindEngine(), sourceId: 'default', sessionId: null, source: 'mcp:put_page', mode: 'queue' },
     );
     expect(r.mode).toBe('queue');
     expect((r as { enqueued: boolean }).enqueued).toBe(true); // NOT gated at submit time
@@ -351,5 +407,24 @@ describe('coverage-gap additions (ship review)', () => {
     expect(err.message).not.toContain('sk-proj');
     // The cause stays reachable for local debugging.
     expect(String((err as { cause?: unknown }).cause)).toContain('401');
+  });
+
+  test('short-lived PGLite failure uses the redacted absorb writer', async () => {
+    process.env.OPENAI_API_KEY = 'sk-test';
+    await engine.setConfig('facts.extraction_model', 'openai:gpt-4o-mini');
+    configureGateway({ env: { OPENAI_API_KEY: 'sk-test' } });
+    __setChatTransportForTests(async () => {
+      throw new Error('401 Incorrect API key provided: sk-proj-pglite-secret');
+    });
+    markShortLivedCliProcess();
+    const r = await runFactsBackstop(
+      { slug: 'outcome-pglite-redacted', type: 'note', compiled_truth: ELIGIBLE_BODY, frontmatter: {} },
+      { engine: engine as BrainEngine, sourceId: 'default', sessionId: null, source: 'mcp:put_page', mode: 'queue' },
+    );
+    expect(r).toEqual({ mode: 'queue', enqueued: true, queueDepth: 0 });
+    const rows = await absorbRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].summary).toBe('gateway_error: provider request failed (FactsExtractionError)');
+    expect(rows[0].summary).not.toContain('sk-proj-pglite-secret');
   });
 });

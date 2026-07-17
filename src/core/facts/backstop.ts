@@ -295,6 +295,24 @@ export async function runFactsBackstop(
     // minions infra), preserving prior behavior + absorb-log visibility.
     const { isShortLivedCliProcess } = await import('./cli-process-mode.ts');
     if (isShortLivedCliProcess()) {
+      // PGLite cannot run the durable `facts-absorb` worker in a second
+      // process because its data directory is exclusively locked. Queuing the
+      // job here would merely trade aborted work for permanently waiting work.
+      // Run synchronously in the owning CLI process instead. This is slower,
+      // but PGLite's only correct execution path is single-process anyway.
+      if (ctx.engine.kind === 'pglite') {
+        const inlineModel = await availabilityGate();
+        if (!inlineModel) {
+          return { mode: 'queue', enqueued: false, queueDepth: 0, skipped: 'extraction_unavailable' };
+        }
+        try {
+          await runPipeline(parsedPage, { ...ctx, model: inlineModel }, ctx.abortSignal);
+        } catch (err) {
+          const { writeFactsAbsorbFailure } = await import('./absorb-log.ts');
+          await writeFactsAbsorbFailure(ctx.engine, parsedPage.slug, err, ctx.sourceId);
+        }
+        return { mode: 'queue', enqueued: true, queueDepth: 0 };
+      }
       try {
         const { MinionQueue } = await import('../minions/queue.ts');
         const { createHash } = await import('node:crypto');
