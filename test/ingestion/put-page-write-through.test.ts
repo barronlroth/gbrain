@@ -16,6 +16,7 @@ import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { operations, OperationError } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
 import { resetGateway } from '../../src/core/ai/gateway.ts';
+import { writePageThrough } from '../../src/core/write-through.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -158,6 +159,23 @@ describe('put_page write-through — trust gating', () => {
     expect(fs.existsSync(result.write_through!.path!)).toBe(true);
   });
 
+  test('trusted dream subagent can defer filesystem persistence to its orchestrator', async () => {
+    const ctx = makeCtx({
+      remote: true,
+      viaSubagent: true,
+      subagentId: 8,
+      allowedSlugPrefixes: ['wiki/personal/reflections/*'],
+      deferWriteThrough: true,
+    });
+    const result = (await putPage.handler(ctx, {
+      slug: 'wiki/personal/reflections/dream-note',
+      content: '---\ntitle: Dream\n---\n\nreflection',
+    })) as { write_through?: { written: boolean; skipped?: string } };
+    expect(result.write_through).toEqual({ written: false, skipped: 'caller_owned' });
+    expect(fs.existsSync(path.join(brainDir, 'wiki/personal/reflections/dream-note.md'))).toBe(false);
+    expect(await engine.getPage('wiki/personal/reflections/dream-note')).not.toBeNull();
+  });
+
   test('dry-run stays DB-only (early-return before importFromContent)', async () => {
     const ctx = makeCtx({ dryRun: true });
     const result = (await putPage.handler(ctx, {
@@ -212,6 +230,34 @@ describe('put_page write-through — multi-source filing', () => {
     expect(result.write_through?.written).toBe(true);
     expect(result.write_through?.path).toBe(path.join(brainDir, '.sources/team-x/shared/page.md'));
     expect(fs.existsSync(result.write_through!.path!)).toBe(true);
+  });
+
+  test('caller can atomically render a source-scoped DB page into an isolated checkout', async () => {
+    await engine.executeRaw(
+      "INSERT INTO sources (id, name) VALUES ('wiki', 'wiki')",
+    );
+    await engine.putPage('wiki/personal/reflections/example', {
+      type: 'note',
+      title: 'Example',
+      compiled_truth: 'See [[wiki/originals/ideas/example]].',
+      timeline: '',
+      frontmatter: { dream_generated: true },
+    }, { sourceId: 'wiki' });
+
+    const reviewRoot = path.join(tmpRoot, 'review-checkout');
+    fs.mkdirSync(reviewRoot, { recursive: true });
+    const result = await writePageThrough(engine, 'wiki/personal/reflections/example', {
+      sourceId: 'wiki',
+      outputSlug: 'personal/reflections/example',
+      targetRootOverride: reviewRoot,
+      commitDurability: false,
+      transformMarkdown: markdown => markdown.replaceAll('[[wiki/', '[['),
+    });
+
+    const expectedPath = path.join(reviewRoot, 'personal/reflections/example.md');
+    expect(result).toMatchObject({ written: true, path: expectedPath });
+    expect(fs.readFileSync(expectedPath, 'utf8')).toContain('[[originals/ideas/example]]');
+    expect(fs.existsSync(path.join(brainDir, '.sources/wiki/wiki/personal/reflections/example.md'))).toBe(false);
   });
 });
 

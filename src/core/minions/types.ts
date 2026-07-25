@@ -537,8 +537,8 @@ export interface SubagentHandlerData {
    * Trusted-workspace allow-list for put_page (v0.23 dream cycle).
    *
    * When set, the subagent's put_page calls are bounded to slugs matching
-   * any of these prefix globs (e.g. ["wiki/personal/reflections/*",
-   * "wiki/originals/*"]). When unset/empty, the legacy
+   * any source-relative prefix globs (e.g. ["personal/reflections/*",
+   * "originals/*"]). When unset/empty, the legacy
    * `wiki/agents/<subagentId>/...` namespace check applies.
    *
    * Trust comes from PROTECTED_JOB_NAMES gating subagent submission — MCP
@@ -546,16 +546,7 @@ export interface SubagentHandlerData {
    * and direct CLI submitters set it.
    */
   allowed_slug_prefixes?: string[];
-  /**
-   * Brain source the subagent's tool calls are scoped to (#1586).
-   *
-   * When set, every tool-call `OperationContext.sourceId` uses this value
-   * instead of the legacy 'default', so put_page writes land in the cycle's
-   * resolved source. Same trust story as `allowed_slug_prefixes`:
-   * PROTECTED_JOB_NAMES gates subagent submission, so only cycle.ts and
-   * direct CLI submitters can set it. Validated via `validateSourceId` at
-   * tool-registry build time.
-   */
+  /** Source id that every subagent brain operation must remain scoped to. */
   source_id?: string;
   /**
    * #4217 — when true, a job whose put_page writes were ALL attempted-and-
@@ -584,6 +575,13 @@ export interface SubagentHandlerData {
    * discipline. Set by the dream fan-out alongside `mode`.
    */
   oneshot_slug_suffix?: string;
+  /**
+   * Skip put_page filesystem write-through because the caller will persist
+   * the final normalized page after child completion.
+   */
+  defer_write_through?: boolean;
+  /** Stamp dream_generated=true before persistence so derived backstops skip it. */
+  dream_generated?: boolean;
   /**
    * v0.41 Approach C: opt out of the auto-generated tool-usage preamble
    * that `buildSystemPrompt()` splices into `system`. Default behavior

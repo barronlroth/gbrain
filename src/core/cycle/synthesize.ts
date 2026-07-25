@@ -48,7 +48,7 @@
  */
 
 import type Anthropic from '@anthropic-ai/sdk';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { chat as gatewayChat, validateModelId, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
@@ -74,6 +74,13 @@ import { throwIfAborted } from '../abort-check.ts';
 export { runSubagentsInline, runDrainRenewalTick };
 import { loadAllowedSlugPrefixes } from './filing-rules.ts';
 export { loadAllowedSlugPrefixes };
+export function toSourceRelativeDreamPrefixes(globs: string[], sourceId: string): string[] {
+  if (sourceId === 'default') return globs;
+  const sourcePrefix = `${sourceId}/`;
+  return [...new Set(globs.map(glob => glob.startsWith(sourcePrefix)
+    ? glob.slice(sourcePrefix.length)
+    : glob))];
+}
 import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscript } from './transcript-discovery.ts';
 import { loadStorageConfig, isDbOnly } from '../storage-config.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
@@ -84,6 +91,7 @@ import { PAGE_SLUG_SEG } from '../cjk.ts';
 import { withChatPhase, estimateChatCostUsd } from '../ai/chat-usage.ts';
 import { verifyAndRepairDreamPages, normForGrounding, type QuoteVerifyStats, type TranscriptForVerify } from './synthesize-verify.ts';
 import { passesTriageGate, rescueConfigOf, DEFAULT_RESCUE_FLOOR, DEFAULT_RESCUE_MIN_SEGMENTS, DEFAULT_RESCUE_CONTENT_TYPES, DEFAULT_RESCUE_CONFIG, type RescueConfig, type RescueVerdictLike } from './triage-rescue.ts';
+import { writePageThrough } from '../write-through.ts';
 
 // Slug grammar from validatePageSlug — shared via PAGE_SLUG_SEG (#738).
 // Used for the orchestrator-written summary index slug. `u` flag required
@@ -388,6 +396,8 @@ async function runPhaseSynthesizeInner(
   if (!isAbsolute(opts.brainDir)) {
     opts.brainDir = resolve(opts.brainDir);
   }
+  const activeSourceId = opts.sourceId ?? readDotfileSourceId(opts.brainDir) ?? 'default';
+  validateSourceId(activeSourceId);
   try {
     throwIfAborted(opts.signal, '[dream] synthesize');
     const config = await loadSynthConfig(engine);
@@ -575,10 +585,22 @@ async function runPhaseSynthesizeInner(
     // per chunk for transcripts that exceed the model's per-prompt budget).
     // #4117: the validated per-lane namespaces derive extra allow-list globs
     // so a custom reflections/originals prefix is actually writable.
-    const allowedSlugPrefixes = await loadAllowedSlugPrefixes(config.outputRoot, engine, {
-      reflectionsPrefix: config.reflectionsPrefix,
-      originalsPrefix: config.originalsPrefix,
-    });
+    const allowedSlugPrefixes = toSourceRelativeDreamPrefixes(
+      await loadAllowedSlugPrefixes(config.outputRoot, engine, {
+        reflectionsPrefix: config.reflectionsPrefix,
+        originalsPrefix: config.originalsPrefix,
+      }),
+      activeSourceId,
+    );
+    const sourceRelativeOutputRoot = activeSourceId !== 'default' && config.outputRoot === activeSourceId
+      ? ''
+      : config.outputRoot;
+    const sourceRelativeReflectionsPrefix = toSourceRelativeDreamPrefixes(
+      [config.reflectionsPrefix], activeSourceId,
+    )[0];
+    const sourceRelativeOriginalsPrefix = toSourceRelativeDreamPrefixes(
+      [config.originalsPrefix], activeSourceId,
+    )[0];
     if (allowedSlugPrefixes.length === 0) {
       return failed(makeError('InternalError', 'NO_ALLOWLIST',
         'skills/_brain-filing-rules.json missing dream_synthesize_paths.globs'));
@@ -589,7 +611,7 @@ async function runPhaseSynthesizeInner(
     // block. Scoped to the cycle's write source so manifest reads see the
     // same universe the oneshot validator probes. Best-effort: a failure
     // here degrades to the manifest-less prompt.
-    const cycleSourceId = opts.sourceId ?? 'default';
+    const cycleSourceId = activeSourceId;
     let manifestCtx: ManifestContext | null = null;
     if (config.linkManifest) {
       try {
@@ -779,13 +801,13 @@ async function runPhaseSynthesizeInner(
       for (let i = 0; i < chunks.length; i++) {
         const childData: SubagentHandlerData = {
           prompt: buildSynthesisPrompt(
-            t, chunks[i], i, chunks.length, priorContradictionsBlock, config.outputRoot,
+            t, chunks[i], i, chunks.length, priorContradictionsBlock, sourceRelativeOutputRoot,
             buildTriageMapBlock(triageVerdict, chunks[i], chunks.length),
             manifestBlock,
             allowedSlugPrefixes,
             // #4117: validated per-lane namespaces.
-            config.reflectionsPrefix,
-            config.originalsPrefix,
+            sourceRelativeReflectionsPrefix,
+            sourceRelativeOriginalsPrefix,
           ),
           model: subagentModel,
           max_turns: config.maxTurns,
@@ -798,9 +820,9 @@ async function runPhaseSynthesizeInner(
             ? `${t.contentHash.slice(0, 6)}-c${i}`
             : t.contentHash.slice(0, 6),
           require_writes: true,
-          // #1586: scope every child tool call to the cycle's resolved source
-          // so put_page writes land there instead of the hardcoded 'default'.
-          ...(opts.sourceId ? { source_id: opts.sourceId } : {}),
+          source_id: activeSourceId,
+          defer_write_through: true,
+          dream_generated: true,
         };
         // Keep producer identity stable when the corpus root moves. Source and
         // complete filename remain explicit so equal bytes in different source
@@ -1049,15 +1071,45 @@ async function runPhaseSynthesizeInner(
     await stampDreamProvenance(engine, writtenRefs, summaryDate, opts.signal);
 
     // Dual-write: reverse-render each DB row → markdown file.
-    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal);
+    const reverseWriteCount = await reverseWriteRefs(
+      engine,
+      opts.brainDir,
+      writtenRefs,
+      activeSourceId,
+      opts.signal,
+    );
+
+    // Deferred transcripts were not synthesized and must not inflate the
+    // summary or phase counters.
+    const submittedTranscripts = Math.max(
+      0,
+      worthProcessing.length - skipReports.length - budgetExhaustedDeferrals.length,
+    );
 
     // Summary index page (deterministic; orchestrator-written via direct
-    // engine.putPage so no allow-list path needed).
+    // engine.putPage so no allow-list path needed). A completed-attempt-only
+    // rerun is a no-op and must not replace an existing rich summary with an
+    // empty 0-child summary.
     const summarySlug = buildDreamSummarySlug(config.outputRoot, summaryDate);
     // Back-compat: writeSummaryPage takes string[] for display; map refs back to slugs.
     const writtenSlugs = writtenRefs.map(r => r.slug);
-    if (SUMMARY_SLUG_RE.test(summarySlug)) {
-      await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, writtenSlugs, childOutcomes, cycleSourceId, opts.signal);
+    const summarySlugs = writtenRefs.map(r => resolveDreamReverseWriteSlug(
+      opts.brainDir,
+      r.slug,
+      r.source_id,
+      activeSourceId,
+    ));
+    if (submittedTranscripts > 0 && SUMMARY_SLUG_RE.test(summarySlug)) {
+      await writeSummaryPage(
+        engine,
+        opts.brainDir,
+        summarySlug,
+        summaryDate,
+        summarySlugs,
+        childOutcomes,
+        activeSourceId,
+        opts.signal,
+      );
     }
 
     // #4077: nothing below runs for a cancelled cycle — no phase-end embed
@@ -1216,12 +1268,7 @@ async function runPhaseSynthesizeInner(
     }
 
     const ms = Date.now() - start;
-    // Adversarial F3: deferred transcripts were NOT synthesized — a run that
-    // deferred 8 of 10 must not report "10 synthesized".
-    const submittedTranscripts = Math.max(
-      0,
-      worthProcessing.length - skipReports.length - budgetExhaustedDeferrals.length,
-    );
+
     const turnsSamples = childOutcomes.filter(
       (o): o is { jobId: number; status: string; turns: number } => typeof o.turns === 'number',
     );
@@ -2605,6 +2652,7 @@ function buildSynthesisPrompt(
   originalsPrefix = `${outputRoot}/originals/ideas`,
 ): string {
   const dateHint = t.inferredDate ?? today();
+
   const baseSlugSegment = sanitizeForSlug(t.basename) || `session-${dateHint}`;
   const isChunked = chunkTotal > 1;
   const hashSuffix = isChunked
@@ -2861,11 +2909,91 @@ async function stampDreamProvenance(
 
 // ── Reverse-write DB rows → markdown files ───────────────────────────
 
+/**
+ * Resolve the slug used for reverse-written markdown inside `brainDir`.
+ *
+ * Dream subagents historically wrote virtual slugs prefixed with the repo
+ * source id (for example `wiki/personal/reflections/...`). Because `brainDir`
+ * is already the active source checkout, strip a matching virtual prefix for
+ * only correctly scoped active-source rows. Legacy default-source rows are
+ * never treated as active-source content: doing so crosses the source boundary.
+ */
+export function resolveDreamReverseWriteSlug(
+  brainDir: string,
+  slug: string,
+  sourceId: string,
+  checkoutSourceId = readDotfileSourceId(brainDir),
+): string {
+  const activeSourceId = checkoutSourceId;
+  if (!activeSourceId) return slug;
+  if (sourceId !== activeSourceId) return slug;
+  const prefix = `${activeSourceId}/`;
+  return slug.startsWith(prefix) ? slug.slice(prefix.length) : slug;
+}
+
+export function resolveDreamReverseWriteFilePath(
+  brainDir: string,
+  slug: string,
+  sourceId: string,
+  checkoutSourceId = readDotfileSourceId(brainDir),
+): string {
+  // Other non-default sources land at brainDir/.sources/<id>/<slug>.md
+  // so same-slug-different-source pages don't collide. Default-source pages
+  // stay at brainDir/<slug>.md. The active checkout source also writes at
+  // the root, even for temporary worktrees without a .gbrain-source dotfile.
+  const activeSourceId = checkoutSourceId;
+  const resolvedSlug = resolveDreamReverseWriteSlug(
+    brainDir,
+    slug,
+    sourceId,
+    activeSourceId,
+  );
+  if (sourceId !== activeSourceId) {
+    return join(brainDir, '.sources', sourceId, `${resolvedSlug}.md`);
+  }
+  return join(brainDir, `${resolvedSlug}.md`);
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function normalizeDreamReverseWriteMarkdown(
+  brainDir: string,
+  markdown: string,
+  sourceId: string,
+  checkoutSourceId = readDotfileSourceId(brainDir),
+): string {
+  // Source-boundary compatibility only. Same-source prefixes are virtual in
+  // the active checkout and must not leak into Obsidian links. Other sources
+  // retain their full paths under `.sources/<id>/...`.
+  const activeSourceId = checkoutSourceId;
+  if (!activeSourceId) return markdown;
+  if (sourceId !== activeSourceId) return markdown;
+  const prefix = escapeRegExp(`${activeSourceId}/`);
+  return markdown
+    .replace(new RegExp(`\\[\\[${prefix}([^\\]]+)\\]\\]`, 'g'), '[[$1]]')
+    .replace(new RegExp(`\\]\\(${prefix}([^\\)]+)\\)`, 'g'), ']($1)');
+}
+
+function readDotfileSourceId(brainDir: string): string | null {
+  const sourcePath = join(brainDir, '.gbrain-source');
+  if (!existsSync(sourcePath)) return null;
+  try {
+    const sourceId = readFileSync(sourcePath, 'utf8').trim();
+    if (!sourceId) return null;
+    validateSourceId(sourceId);
+    return sourceId;
+  } catch {
+    return null;
+  }
+}
+
 async function reverseWriteRefs(
   engine: BrainEngine,
   brainDir: string,
   refs: Array<{ slug: string; source_id: string }>,
-  nativeSourceId = 'default',
+  checkoutSourceId?: string,
   signal?: AbortSignal,
 ): Promise<number> {
   let count = 0;
@@ -2873,29 +3001,27 @@ async function reverseWriteRefs(
     throwIfAborted(signal, '[dream] synthesize reverse-write');
     // v0.32.8 F6: validate source_id is filesystem-safe before any join().
     validateSourceId(source_id);
-    const page = await engine.getPage(slug, { sourceId: source_id });
-    if (!page) continue;
-    const tags = await engine.getTags(slug, { sourceId: source_id });
-    // #4077: re-check after the row reads — an abort that lands during
-    // getPage/getTags must not reach this ref's file write.
-    throwIfAborted(signal, '[dream] synthesize reverse-write');
-    try {
-      const md = renderPageToMarkdown(page, tags);
-      // v0.32.8 F6: foreign-source pages land at brainDir/.sources/<id>/<slug>.md
-      // so same-slug-different-source pages don't collide. Pages belonging to
-      // the cycle's own source (#1586: brainDir IS that source's checkout —
-      // legacy 'default' when unscoped) stay at brainDir/<slug>.md.
-      const filePath = source_id === nativeSourceId
-        ? join(brainDir, `${slug}.md`)
-        : join(brainDir, '.sources', source_id, `${slug}.md`);
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, md, 'utf8');
-      count++;
-    } catch (e) {
-      // Per-slug failures are non-fatal — phase continues.
-      const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`[dream] reverse-write ${slug}@${source_id} failed: ${msg}\n`);
+    if (source_id !== checkoutSourceId) {
+      process.stderr.write(`[dream] reverse-write ${slug}@${source_id} skipped: not active source ${checkoutSourceId ?? '(unset)'}\n`);
+      continue;
     }
+    throwIfAborted(signal, '[dream] synthesize reverse-write');
+    const outputSlug = resolveDreamReverseWriteSlug(brainDir, slug, source_id, checkoutSourceId);
+    const result = await writePageThrough(engine, slug, {
+      sourceId: source_id,
+      outputSlug,
+      targetRootOverride: brainDir,
+      commitDurability: false,
+      signal,
+      transformMarkdown: (markdown) => normalizeDreamReverseWriteMarkdown(
+        brainDir,
+        markdown,
+        source_id,
+        checkoutSourceId,
+      ),
+      logger: { warn: (message) => process.stderr.write(`[dream] ${message}\n`) },
+    });
+    if (result.written) count++;
   }
   return count;
 }
@@ -2990,14 +3116,8 @@ async function writeSummaryPage(
     frontmatter: parsed.frontmatter,
   }, { sourceId });
 
-  // Also write to disk (orchestrator dual-write). #4506: the unconditional
-  // file write dirtied clean source repos (an untracked
-  // dream-cycle-summaries/<date>.md after every nightly run). Two
-  // suppressors, both leaving the DB row untouched:
-  //   - explicit knob `dream.synthesize.summary_file_write=false|0|off`
-  //     (default ON — back-compat for brains that expect the dual-write);
-  //   - a gbrain.yml storage tier that declares the summary slug `db_only`
-  //     (the DB/file-plane split the reporter expected to cover this path).
+  // Also write to disk (orchestrator dual-write). #4506: two suppressors
+  // leave the DB row untouched while avoiding unwanted repo dirtiness.
   const fileWriteRaw = (await engine.getConfig('dream.synthesize.summary_file_write'))?.trim().toLowerCase();
   const fileWriteEnabled = !(fileWriteRaw === 'false' || fileWriteRaw === '0' || fileWriteRaw === 'off');
   let dbOnlyTier = false;
@@ -3006,8 +3126,8 @@ async function writeSummaryPage(
       const storage = loadStorageConfig(brainDir);
       dbOnlyTier = storage !== null && isDbOnly(summarySlug, storage);
     } catch {
-      // Unreadable gbrain.yml — keep the dual-write default (fail-open to
-      // pre-#4506 behavior; sync owns loud storage-config validation).
+      // Unreadable gbrain.yml — keep the dual-write default; sync owns loud
+      // storage-config validation.
     }
   }
   if (!fileWriteEnabled || dbOnlyTier) {
@@ -3015,13 +3135,18 @@ async function writeSummaryPage(
     process.stderr.write(`[dream] summary file-write skipped (${why}): ${summarySlug} lives in the DB only\n`);
     return;
   }
-  try {
-    const filePath = join(brainDir, `${summarySlug}.md`);
-    mkdirSync(dirname(filePath), { recursive: true });
-    writeFileSync(filePath, fullMarkdown, 'utf8');
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    process.stderr.write(`[dream] summary file-write failed: ${msg}\n`);
+
+  // Route the enabled file write through the shared guarded/atomic path.
+  const writeResult = await writePageThrough(engine, summarySlug, {
+    sourceId,
+    outputSlug: summarySlug,
+    targetRootOverride: brainDir,
+    commitDurability: false,
+    signal,
+    logger: { warn: (message) => process.stderr.write(`[dream] ${message}\n`) },
+  });
+  if (!writeResult.written) {
+    process.stderr.write(`[dream] summary file-write skipped: ${writeResult.skipped ?? writeResult.error ?? 'unknown'}\n`);
   }
 }
 

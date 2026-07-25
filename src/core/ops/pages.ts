@@ -322,6 +322,17 @@ const fetch_page: Operation = {
   cliHints: { name: 'fetch', positional: ['id'] },
 };
 
+export function stampDreamGeneratedMarkdown(content: string): string {
+  const match = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---(?:\r?\n|$))/);
+  if (!match) return `---\ndream_generated: true\n---\n\n${content}`;
+
+  const existing = /^dream_generated\s*:.*$/gim;
+  const frontmatter = existing.test(match[2])
+    ? match[2].replace(existing, 'dream_generated: true')
+    : `${match[2]}${match[2].endsWith('\n') ? '' : '\n'}dream_generated: true`;
+  return `${match[1]}${frontmatter}${match[3]}${content.slice(match[0].length)}`;
+}
+
 const put_page: Operation = {
   name: 'put_page',
   description: 'Write or replace a page (markdown with frontmatter). REPLACES the entire page; this is not a partial edit. Before modifying an existing page, read its canonical content with `get_page include_content:true`, then submit the complete page. Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. Remote (MCP) callers: body wikilinks are NOT reconciled into the graph — auto_link/auto_timeline are skipped for untrusted writers (response reports auto_links: {skipped: "remote"}); use local capture/put_page for link extraction. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
@@ -435,7 +446,10 @@ const put_page: Operation = {
       // Pack load failed; fall through to legacy inferType behavior.
       activePack = undefined;
     }
-    const result = await importFromContent(ctx.engine, slug, p.content as string, {
+    const content = ctx.dreamGenerated === true
+      ? stampDreamGeneratedMarkdown(p.content as string)
+      : p.content as string;
+    const result = await importFromContent(ctx.engine, slug, content, {
       noEmbed,
       // v0.42 (#1699): untrusted callers can't smuggle gate-owned frontmatter
       // markers (quarantine/content_flag/embed_skip). Fail-closed — anything
@@ -530,10 +544,11 @@ const put_page: Operation = {
     // put_page's own trust-gating produces two skip reasons ('subagent_sandbox',
     // 'dry_run') that never come out of writePageThrough itself — widen the
     // field rather than losing the commit/pushed/lastPushStatus typing.
-    let writeThrough: (Omit<WriteThroughResult, 'skipped'> & { skipped?: WriteThroughResult['skipped'] | 'subagent_sandbox' | 'dry_run' }) | undefined;
+    let writeThrough: (Omit<WriteThroughResult, 'skipped'> & { skipped?: WriteThroughResult['skipped'] | 'caller_owned' | 'subagent_sandbox' | 'dry_run' }) | undefined;
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
-    if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
+    const callerOwnsWriteThrough = ctx.deferWriteThrough === true;
+    if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent && !callerOwnsWriteThrough) {
       const sourceId = ctx.sourceId ?? 'default';
       const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
       // Shared canonical write-through (also used by `gbrain brainstorm/lsd
@@ -548,6 +563,8 @@ const put_page: Operation = {
         },
         logger: ctx.logger,
       });
+    } else if (callerOwnsWriteThrough) {
+      writeThrough = { written: false, skipped: 'caller_owned' };
     } else if (isSandboxSubagent) {
       writeThrough = { written: false, skipped: 'subagent_sandbox' };
     } else if (ctx.dryRun) {
@@ -567,6 +584,7 @@ const put_page: Operation = {
     if (writeThrough && !writeThrough.written
       && writeThrough.skipped !== 'no_repo_configured'
       && writeThrough.skipped !== 'disabled_by_config'
+      && writeThrough.skipped !== 'caller_owned'
       && writeThrough.skipped !== 'subagent_sandbox'
       && writeThrough.skipped !== 'dry_run') {
       // Roll back rather than leave an index-only orphan, but only when this

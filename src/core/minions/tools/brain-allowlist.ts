@@ -214,6 +214,10 @@ export interface BuildBrainToolsOpts {
    * Unset → legacy 'default'.
    */
   sourceId?: string;
+  /** Caller owns filesystem persistence (dream orchestrator reverse-write). */
+  deferWriteThrough?: boolean;
+  /** Stamp writes as dream-generated before persistence. */
+  dreamGenerated?: boolean;
 }
 
 interface OpContextDeps {
@@ -223,9 +227,11 @@ interface OpContextDeps {
   jobId: number;
   signal?: AbortSignal;
   brainId?: string;
-  allowedSlugPrefixes?: readonly string[];
   sourceId?: string;
   deferEmbeds?: boolean;
+  allowedSlugPrefixes?: readonly string[];
+  deferWriteThrough?: boolean;
+  dreamGenerated?: boolean;
 }
 
 function buildOpContext(deps: OpContextDeps): OperationContext {
@@ -251,6 +257,8 @@ function buildOpContext(deps: OpContextDeps): OperationContext {
     // #4216: server-side-only — the oneshot runner defers chunk embeddings on
     // its programmatic writes; never hydrated from any wire payload.
     ...(deps.deferEmbeds ? { deferEmbeds: true } : {}),
+    deferWriteThrough: deps.deferWriteThrough,
+    dreamGenerated: deps.dreamGenerated,
   };
 }
 
@@ -300,9 +308,11 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
           jobId: ctx.jobId,
           signal: ctx.signal,
           brainId: opts.brainId,
-          allowedSlugPrefixes: opts.allowedSlugPrefixes,
           sourceId: opts.sourceId,
           deferEmbeds: opts.deferEmbeds,
+          allowedSlugPrefixes: opts.allowedSlugPrefixes,
+          deferWriteThrough: opts.deferWriteThrough,
+          dreamGenerated: opts.dreamGenerated,
         });
         const params = (input && typeof input === 'object') ? input as Record<string, unknown> : {};
         return op.handler(opCtx, params);

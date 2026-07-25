@@ -136,6 +136,43 @@ describe('buildBrainTools', () => {
     expect(res).toBeTruthy();
   });
 
+  test('trusted dream tools preserve source scope and defer filesystem persistence', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('wiki', 'Wiki') ON CONFLICT (id) DO NOTHING`,
+    );
+    const tools = buildBrainTools({
+      subagentId: 42,
+      engine,
+      config,
+      sourceId: 'wiki',
+      allowedSlugPrefixes: ['personal/reflections/*'],
+      deferWriteThrough: true,
+      dreamGenerated: true,
+    });
+    const putPage = tools.find(t => t.name === 'brain_put_page');
+    const ctx: ToolCtx = { engine, jobId: 1, remote: true };
+    const res = await putPage!.execute(
+      {
+        slug: 'personal/reflections/dream-note',
+        content: `---\ntitle: Dream\n---\n${'source-scoped reflection '.repeat(40)}`,
+      },
+      ctx,
+    ) as {
+      write_through?: { written: boolean; skipped?: string };
+      facts_backstop?: { skipped?: string };
+      chronicle_backstop?: { skipped?: string };
+    };
+
+    expect(res.write_through).toEqual({ written: false, skipped: 'caller_owned' });
+    // Upstream's stricter delegated-write gate short-circuits before the
+    // dream-generated eligibility check; either way, no facts job is spawned.
+    expect(res.facts_backstop).toEqual({ skipped: 'slug_bound_client' });
+    expect(res.chronicle_backstop).toEqual({ skipped: 'dream_generated' });
+    const page = await engine.getPage('personal/reflections/dream-note', { sourceId: 'wiki' });
+    expect(page?.frontmatter.dream_generated).toBe(true);
+    expect(await engine.getPage('personal/reflections/dream-note', { sourceId: 'default' })).toBeNull();
+  });
+
   test('execute() on put_page with out-of-namespace slug throws permission_denied', async () => {
     const tools = buildBrainTools({ subagentId: 42, engine, config });
     const putPage = tools.find(t => t.name === 'brain_put_page');

@@ -95,6 +95,23 @@ export interface WritePageThroughOpts {
   sourceId?: string;
   /** Merged over the page's own frontmatter at render time (e.g. provenance). */
   frontmatterOverrides?: Record<string, unknown>;
+  /**
+   * Trusted cycle-orchestrator seam: write this DB page under a normalized,
+   * source-relative disk slug without mutating the row's canonical slug.
+   */
+  outputSlug?: string;
+  /**
+   * Trusted cycle-orchestrator seam for isolated worktrees (`gbrain dream
+   * --dir ...`). The same containment, collision, and atomic-write guards still
+   * apply; only source-registry target discovery is bypassed.
+   */
+  targetRootOverride?: string;
+  /** Final markdown transform applied after the shared DB renderer. */
+  transformMarkdown?: (markdown: string) => string;
+  /** Disable durability auto-commit for temporary/review worktrees. */
+  commitDurability?: boolean;
+  /** Cooperative cancellation checked before any filesystem mutation. */
+  signal?: AbortSignal;
   logger?: WriteThroughLogger;
 }
 
@@ -278,10 +295,28 @@ export async function resolvePageWriteTarget(
   engine: BrainEngine,
   slug: string,
   sourceId: string,
+  opts: Pick<WritePageThroughOpts, 'outputSlug' | 'targetRootOverride'> = {},
 ): Promise<PageWriteTarget> {
   let filePath: string;
   let writeRoot: string;
   let scanRoot: string;
+  const outputSlug = opts.outputSlug ?? slug;
+  const useRecordedPath = outputSlug === slug;
+
+  if (opts.targetRootOverride) {
+    const targetRoot = msysToNativePath(opts.targetRootOverride);
+    if (!existsSync(targetRoot) || !statSync(targetRoot).isDirectory()) {
+      return { ok: false, skipped: 'repo_not_found' };
+    }
+    filePath = join(targetRoot, `${outputSlug}.md`);
+    writeRoot = targetRoot;
+    scanRoot = targetRoot;
+    if (!isWriteTargetContained(filePath, writeRoot)) {
+      return { ok: false, skipped: 'path_escapes_source_root' };
+    }
+    return { ok: true, filePath, writeRoot, sourcePathToBind: scannerSourcePath(scanRoot, filePath) };
+  }
+
   const srcRows = await engine.executeRaw<{ local_path: string | null }>(
     `SELECT local_path FROM sources WHERE id = $1`,
     [sourceId],
@@ -304,10 +339,10 @@ export async function resolvePageWriteTarget(
     if (!existsSync(sourceLocalPath) || !statSync(sourceLocalPath).isDirectory()) {
       return { ok: false, skipped: 'repo_not_found' };
     }
-    filePath = recordedPath
+    filePath = useRecordedPath && recordedPath
       // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- result passes isWriteTargetContained before any write (#4204/#4289 guard)
       ? resolveSourceLocalFilePath(sourceLocalPath, recordedPath) ?? join(sourceLocalPath, `${slug}.md`)
-      : join(sourceLocalPath, recordedPathFromFileUri(recordedUri, sourceLocalPath) ?? `${slug}.md`); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- result passes isWriteTargetContained before any write (#4204/#4289 guard)
+      : join(sourceLocalPath, (useRecordedPath ? recordedPathFromFileUri(recordedUri, sourceLocalPath) : null) ?? `${outputSlug}.md`); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- result passes isWriteTargetContained before any write (#4204/#4289 guard)
     writeRoot = sourceLocalPath;
     scanRoot = sourceLocalPath;
   } else {
@@ -328,8 +363,10 @@ export async function resolvePageWriteTarget(
       return { ok: false, skipped: 'source_repo_belongs_to_other_source' };
     }
     const pageRoot = sourceId === 'default' ? repoPath : join(repoPath, '.sources', sourceId);
-    const knownPath = recordedPath ?? recordedPathFromFileUri(recordedUri, pageRoot);
-    filePath = knownPath ? join(pageRoot, knownPath) : resolvePageFilePath(repoPath, slug, sourceId);
+    const knownPath = useRecordedPath
+      ? recordedPath ?? recordedPathFromFileUri(recordedUri, pageRoot)
+      : null;
+    filePath = knownPath ? join(pageRoot, knownPath) : resolvePageFilePath(repoPath, outputSlug, sourceId);
     writeRoot = repoPath;
     // pageRoot, not repoPath: a later `sources add --path <pageRoot>` scan
     // walks pageRoot, so the bind must speak that scan's convention.
@@ -360,7 +397,9 @@ export async function writePageThrough(
   opts: WritePageThroughOpts = {},
 ): Promise<WriteThroughResult> {
   const sourceId = opts.sourceId ?? 'default';
+  const outputSlug = opts.outputSlug ?? slug;
   try {
+    opts.signal?.throwIfAborted();
     // Opt-out flag: `sync.write_through=false` (or '0'/'off'/'no', any case)
     // makes every page write DB-only, for brains whose host repo is a shared
     // working tree where per-page `.md` artifacts are unwanted. Unset or any
@@ -369,7 +408,10 @@ export async function writePageThrough(
     if (await isWriteThroughDisabled(engine)) {
       return { written: false, skipped: 'disabled_by_config' };
     }
-    const target = await resolvePageWriteTarget(engine, slug, sourceId);
+    const target = await resolvePageWriteTarget(engine, slug, sourceId, {
+      outputSlug,
+      targetRootOverride: opts.targetRootOverride,
+    });
     if (!target.ok) {
       return { written: false, skipped: target.skipped };
     }
@@ -381,9 +423,13 @@ export async function writePageThrough(
     }
 
     const tags = await engine.getTags(slug, { sourceId });
-    const md = serializePageToMarkdown(writtenPage, tags, {
+    // Reads above can race cancellation. Do not let an aborted cycle mutate
+    // the checkout after its parent has begun unwinding.
+    opts.signal?.throwIfAborted();
+    let md = serializePageToMarkdown(writtenPage, tags, {
       frontmatterOverrides: opts.frontmatterOverrides,
     });
+    if (opts.transformMarkdown) md = opts.transformMarkdown(md);
 
     // #2831: two distinct DB slugs differing only by case (FOO vs foo) resolve
     // to the SAME file on a case-insensitive filesystem — the second write
@@ -462,8 +508,8 @@ export async function writePageThrough(
     let pushed: 'pending' | undefined;
     let lastPushStatus: PushLogOutcome | undefined;
     try {
-      if (isDurabilityHardened(writeRoot)) {
-        committed = commitWriteThroughFile(writeRoot, filePath, slug);
+      if (opts.commitDurability !== false && isDurabilityHardened(writeRoot)) {
+        committed = commitWriteThroughFile(writeRoot, filePath, outputSlug);
         if (committed) {
           pushed = 'pending';
           lastPushStatus = getLastPushOutcome(currentBranch(writeRoot));

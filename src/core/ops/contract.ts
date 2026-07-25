@@ -317,6 +317,17 @@ export interface OperationContext {
   subagentId?: number;
   viaSubagent?: boolean;
   /**
+   * Caller owns filesystem persistence for this write. Dream children use
+   * this to persist the source-scoped DB row while the cycle orchestrator
+   * performs the single normalized reverse-write into its selected checkout.
+   */
+  deferWriteThrough?: boolean;
+  /**
+   * Stamp dream_generated=true before import so facts and Chronicle anti-loop
+   * guards see synthetic content during the original child write.
+   */
+  dreamGenerated?: boolean;
+  /**
    * Trusted-workspace allow-list (v0.23 dream cycle). When the cycle's
    * synthesize/patterns phases dispatch a subagent, they thread an
    * explicit list of slug-prefix globs (e.g. "wiki/personal/reflections/*")

@@ -18,8 +18,6 @@
  *     ON CONFLICT semantics in importFromContent).
  */
 
-import { join, dirname } from 'node:path';
-import { mkdirSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
@@ -38,10 +36,19 @@ import type { Page, PageType } from '../types.ts';
 // data-dir, on Postgres because the parent phase itself occupies a worker
 // slot and can deadlock a fully-occupied worker (#2050). synthesize.ts
 // drains its own children the same way.
-import { loadAllowedSlugPrefixes, loadOutputRoot, runSubagentsInline } from './synthesize.ts';
+import {
+  loadAllowedSlugPrefixes,
+  loadOutputRoot,
+  normalizeDreamReverseWriteMarkdown,
+  resolveDreamReverseWriteSlug,
+  runSubagentsInline,
+  toSourceRelativeDreamPrefixes,
+} from './synthesize.ts';
 import { probeChatModel } from '../ai/gateway.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { throwIfAborted } from '../abort-check.ts';
+import { validateSourceId } from '../utils.ts';
+import { writePageThrough } from '../write-through.ts';
 
 export interface PatternsPhaseOpts {
   brainDir: string;
@@ -134,6 +141,10 @@ export async function runPhasePatterns(
   try {
     throwIfAborted(opts.signal, '[dream] patterns');
     const config = await loadPatternsConfig(engine);
+    const activeSourceId = opts.sourceId ?? 'default';
+    validateSourceId(activeSourceId);
+    const sourceSlugPrefix = toSourceRelativePatternPrefix(config.sourceSlugPrefix, activeSourceId);
+    const outputSlugPrefix = toSourceRelativePatternPrefix(config.outputSlugPrefix, activeSourceId);
 
     if (!config.enabled) {
       if (!opts.once) {
@@ -146,7 +157,12 @@ export async function runPhasePatterns(
     }
 
     // Gather reflections within lookback window.
-    const reflections = await gatherReflections(engine, config.lookbackDays, config.sourceSlugPrefix);
+    const reflections = await gatherReflections(
+      engine,
+      config.lookbackDays,
+      sourceSlugPrefix,
+      activeSourceId,
+    );
     if (reflections.length < config.minEvidence) {
       return skipped(
         'insufficient_evidence',
@@ -178,7 +194,10 @@ export async function runPhasePatterns(
       return skipped('no_provider', `pattern detection skipped: ${probe.detail}`);
     }
 
-    const allowedSlugPrefixes = await loadAllowedSlugPrefixes(config.outputRoot, engine);
+    const allowedSlugPrefixes = toSourceRelativeDreamPrefixes(
+      await loadAllowedSlugPrefixes(config.outputRoot, engine),
+      activeSourceId,
+    );
     if (allowedSlugPrefixes.length === 0) {
       return failed(makeError('InternalError', 'NO_ALLOWLIST',
         'skills/_brain-filing-rules.json missing dream_synthesize_paths.globs'));
@@ -189,7 +208,7 @@ export async function runPhasePatterns(
     // globs above, which only remap the `wiki/personal/patterns/*` literal
     // by outputRoot. Add it explicitly so the subagent's put_page allow-list
     // actually grants write access to wherever it's configured to write.
-    const outputGlob = `${config.outputSlugPrefix}/*`;
+    const outputGlob = `${outputSlugPrefix}/*`;
     if (!allowedSlugPrefixes.includes(outputGlob)) {
       allowedSlugPrefixes.push(outputGlob);
     }
@@ -223,7 +242,7 @@ export async function runPhasePatterns(
       childQueueName, privateQueueOwnerToken, opts.yieldDuringPhase,
     );
     const data: SubagentHandlerData = {
-      prompt: buildPatternsPrompt(reflections, config.minEvidence, config.sourceSlugPrefix, config.outputSlugPrefix),
+      prompt: buildPatternsPrompt(reflections, config.minEvidence, sourceSlugPrefix, outputSlugPrefix),
       model: config.model,
       max_turns: 30,
       // #4217/CDX-12: a patterns child whose every put_page failed must
@@ -231,9 +250,9 @@ export async function runPhasePatterns(
       // completed with zero pages.
       require_writes: true,
       allowed_slug_prefixes: allowedSlugPrefixes,
-      // #1586: scope every child tool call to the cycle's resolved source so
-      // put_page writes land there instead of the hardcoded 'default'.
-      ...(opts.sourceId ? { source_id: opts.sourceId } : {}),
+      source_id: activeSourceId,
+      defer_write_through: true,
+      dream_generated: true,
     };
     const submitOpts: Partial<MinionJobInput> = {
       max_stalled: 3,
@@ -304,17 +323,19 @@ export async function runPhasePatterns(
     // Collect refs the subagent wrote (codex finding #2 — query tool exec rows).
     // v0.32.8: refs carry source_id so reverseWriteRefs targets the right
     // (source, slug) row instead of the first DB match.
-    // #1586: refs carry the cycle's resolved source (children wrote there via
-    // SubagentHandlerData.source_id), so getPage/getTags read the same row the
-    // child wrote, and the reverse-write treats it as the native source.
-    const cycleSourceId = opts.sourceId ?? 'default';
     // #4077: no post-abort derived-state writes (collection is a read, but
     // the reverse-write below dual-writes files).
     throwIfAborted(opts.signal, '[dream] patterns output');
-    const writtenRefs = await collectChildPutPageSlugs(engine, [job.id], cycleSourceId);
+    const writtenRefs = await collectChildPutPageSlugs(engine, [job.id], activeSourceId);
 
     // Reverse-write to fs.
-    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal);
+    const reverseWriteCount = await reverseWriteRefs(
+      engine,
+      opts.brainDir,
+      writtenRefs,
+      activeSourceId,
+      opts.signal,
+    );
 
     const details = {
       reflections_considered: reflections.length,
@@ -468,6 +489,12 @@ async function loadPatternsConfig(engine: BrainEngine): Promise<PatternsConfig> 
 
 // ── Reflection gathering ─────────────────────────────────────────────
 
+export function toSourceRelativePatternPrefix(prefix: string, sourceId: string): string {
+  if (sourceId === 'default') return prefix;
+  const sourcePrefix = `${sourceId}/`;
+  return prefix.startsWith(sourcePrefix) ? prefix.slice(sourcePrefix.length) : prefix;
+}
+
 interface ReflectionRef {
   slug: string;
   title: string;
@@ -478,6 +505,7 @@ async function gatherReflections(
   engine: BrainEngine,
   lookbackDays: number,
   sourceSlugPrefix = 'wiki/personal/reflections',
+  sourceId = 'default',
 ): Promise<ReflectionRef[]> {
   const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
   // Reflections live under the configured source slug prefix (bound as a
@@ -486,10 +514,11 @@ async function gatherReflections(
     `SELECT slug, title, compiled_truth
        FROM pages
       WHERE slug LIKE $2
+        AND source_id = $3
         AND updated_at >= $1::timestamptz
       ORDER BY updated_at DESC
       LIMIT 100`,
-    [since, `${sourceSlugPrefix}/%`],
+    [since, `${sourceSlugPrefix}/%`, sourceId],
   );
   return rows.map(r => ({
     slug: r.slug,
@@ -570,13 +599,11 @@ async function collectChildPutPageSlugs(
 
 // ── Reverse-write ────────────────────────────────────────────────────
 
-import { validateSourceId } from '../utils.ts';
-
 async function reverseWriteRefs(
   engine: BrainEngine,
   brainDir: string,
   refs: Array<{ slug: string; source_id: string }>,
-  nativeSourceId = 'default',
+  activeSourceId: string,
   signal?: AbortSignal,
 ): Promise<number> {
   let count = 0;
@@ -585,45 +612,29 @@ async function reverseWriteRefs(
     // v0.32.8 F6: guard against malformed source_id (would let join() break
     // out of brainDir). validateSourceId throws on `..`, `/`, etc.
     validateSourceId(source_id);
-    const page = await engine.getPage(slug, { sourceId: source_id });
-    if (!page) continue;
-    const tags = await engine.getTags(slug, { sourceId: source_id });
-    // #4077: re-check after the row reads — an abort that lands during
-    // getPage/getTags must not reach this ref's file write.
-    throwIfAborted(signal, '[dream] patterns reverse-write');
-    try {
-      const md = renderPageToMarkdown(page, tags);
-      // v0.32.8 F6: foreign-source pages land under brainDir/.sources/<id>/<slug>.md
-      // so same-slug-different-source pages don't collide on disk. Pages belonging
-      // to the cycle's own source (#1586: brainDir IS that source's checkout —
-      // legacy 'default' when unscoped) stay at brainDir/<slug>.md so single-source
-      // brains see no change. `.sources/` is a reserved prefix; walkBrainRepo skips dot-dirs.
-      const filePath = source_id === nativeSourceId
-        ? join(brainDir, `${slug}.md`)
-        : join(brainDir, '.sources', source_id, `${slug}.md`);
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, md, 'utf8');
-      count++;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`[dream] reverse-write ${slug}@${source_id} failed: ${msg}\n`);
+    if (source_id !== activeSourceId) {
+      process.stderr.write(`[dream] patterns reverse-write ${slug}@${source_id} skipped: not active source ${activeSourceId}\n`);
+      continue;
     }
+    throwIfAborted(signal, '[dream] patterns reverse-write');
+    const outputSlug = resolveDreamReverseWriteSlug(brainDir, slug, source_id, activeSourceId);
+    const result = await writePageThrough(engine, slug, {
+      sourceId: source_id,
+      outputSlug,
+      targetRootOverride: brainDir,
+      commitDurability: false,
+      signal,
+      transformMarkdown: (markdown) => normalizeDreamReverseWriteMarkdown(
+        brainDir,
+        markdown,
+        source_id,
+        activeSourceId,
+      ),
+      logger: { warn: (message) => process.stderr.write(`[dream] ${message}\n`) },
+    });
+    if (result.written) count++;
   }
   return count;
-}
-
-function renderPageToMarkdown(page: Page, tags: string[]): string {
-  const frontmatter = (page.frontmatter ?? {}) as Record<string, unknown>;
-  return serializeMarkdown(
-    frontmatter,
-    page.compiled_truth ?? '',
-    page.timeline ?? '',
-    {
-      type: (page.type as string) ?? 'note',
-      title: page.title ?? '',
-      tags,
-    },
-  );
 }
 
 // ── Status helpers ───────────────────────────────────────────────────

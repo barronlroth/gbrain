@@ -19,7 +19,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
@@ -219,6 +219,7 @@ describe('E2E synthesize chunking — D8 legacy-key migration', () => {
           const result = await runPhaseSynthesize(rig.engine, {
             brainDir: rig.brainDir,
             dryRun: false,
+            date: '2026-04-25',
           });
           const details = result.details as {
             children_submitted: number;
@@ -235,6 +236,12 @@ describe('E2E synthesize chunking — D8 legacy-key migration', () => {
         `SELECT count(*) AS cnt FROM minion_jobs WHERE name = 'subagent'`,
       );
       expect(Number(jobs[0].cnt)).toBe(1);
+
+      // A completed-attempt-only rerun must not replace a useful summary
+      // with an empty "0 children" page.
+      const summarySlug = 'dream-cycle-summaries/2026-04-25';
+      expect(existsSync(join(rig.brainDir, `${summarySlug}.md`))).toBe(false);
+      expect(await rig.engine.getPage(summarySlug)).toBeNull();
     } finally {
       rmSync(oldCorpusDir, { recursive: true, force: true });
       await rig.cleanup();
@@ -362,11 +369,14 @@ describe('E2E synthesize chunking — D8 legacy-key migration', () => {
 });
 
 describe('E2E synthesize chunking — fan-out shape', () => {
-  test('single-chunk transcript key excludes the corpus root', async () => {
+  test('single-chunk transcript is source-scoped with caller-owned write-through', async () => {
     const rig = await setupRig();
     try {
       await rig.engine.setConfig('dream.synthesize.enabled', 'true');
       await rig.engine.setConfig('dream.synthesize.session_corpus_dir', rig.corpusDir);
+      await rig.engine.executeRaw(
+        `INSERT INTO sources (id, name) VALUES ('wiki', 'Wiki') ON CONFLICT (id) DO NOTHING`,
+      );
       // Default budget is plenty for 5KB content.
 
       const basename = '2026-04-25-small.txt';
@@ -380,6 +390,7 @@ describe('E2E synthesize chunking — fan-out shape', () => {
           const result = await runPhaseSynthesize(rig.engine, {
             brainDir: rig.brainDir,
             dryRun: false,
+            sourceId: 'wiki',
           });
           const details = result.details as { children_submitted: number };
           expect(details.children_submitted).toBe(1);
@@ -387,14 +398,26 @@ describe('E2E synthesize chunking — fan-out shape', () => {
       });
 
       const expectedKey =
-        `dream:synth-v2:default:filename:${encodeURIComponent(basename)}:${contentHash.slice(0, 16)}`;
-      const rows = await rig.engine.executeRaw<{ idempotency_key: string }>(
-        `SELECT idempotency_key FROM minion_jobs WHERE name = 'subagent' ORDER BY id`,
+        `dream:synth-v2:wiki:filename:${encodeURIComponent(basename)}:${contentHash.slice(0, 16)}`;
+      const rows = await rig.engine.executeRaw<{
+        idempotency_key: string;
+        data: Record<string, unknown>;
+      }>(
+        `SELECT idempotency_key, data FROM minion_jobs WHERE name = 'subagent' ORDER BY id`,
       );
       expect(rows).toHaveLength(1);
       expect(rows[0].idempotency_key).toBe(expectedKey);
       // Single-chunk keys have no ":c<idx>of<n>" suffix.
       expect(rows[0].idempotency_key).not.toMatch(/:c\d+of\d+$/);
+      expect(rows[0].data.source_id).toBe('wiki');
+      expect(rows[0].data.defer_write_through).toBe(true);
+      expect(rows[0].data.dream_generated).toBe(true);
+      const allowed = rows[0].data.allowed_slug_prefixes as string[];
+      expect(allowed).toContain('personal/reflections/*');
+      expect(allowed).toContain('originals/*');
+      expect(allowed.some(prefix => prefix.startsWith('wiki/'))).toBe(false);
+      expect(String(rows[0].data.prompt)).toContain('slug: `personal/reflections/');
+      expect(String(rows[0].data.prompt)).not.toContain('slug: `wiki/personal/reflections/');
     } finally {
       await rig.cleanup();
     }

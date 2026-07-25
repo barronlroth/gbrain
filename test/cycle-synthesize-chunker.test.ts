@@ -17,7 +17,16 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { splitTranscriptByBudget, rewriteChunkedSlug } from '../src/core/cycle/synthesize.ts';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  splitTranscriptByBudget,
+  rewriteChunkedSlug,
+  normalizeDreamReverseWriteMarkdown,
+  resolveDreamReverseWriteFilePath,
+  resolveDreamReverseWriteSlug,
+} from '../src/core/cycle/synthesize.ts';
 
 describe('splitTranscriptByBudget — single chunk path', () => {
   test('returns single-element array when content <= maxChars', () => {
@@ -172,6 +181,95 @@ describe('rewriteChunkedSlug — D6 zero-Sonnet-trust slug rewrite', () => {
 
   test('empty slug passes through', () => {
     expect(rewriteChunkedSlug('', 'abc123', 0)).toBe('');
+  });
+});
+
+describe('resolveDreamReverseWriteFilePath — source-aware wiki checkout guard', () => {
+  function withTempBrainDir(fn: (dir: string) => void): void {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-dream-reverse-'));
+    try {
+      fn(dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('does not treat legacy default-source dream rows as active-source content', () => {
+    withTempBrainDir((dir) => {
+      writeFileSync(join(dir, '.gbrain-source'), 'wiki\n', 'utf8');
+      expect(resolveDreamReverseWriteSlug(dir, 'wiki/personal/reflections/foo', 'default'))
+        .toBe('wiki/personal/reflections/foo');
+      expect(resolveDreamReverseWriteFilePath(dir, 'wiki/personal/reflections/foo', 'default'))
+        .toBe(join(dir, '.sources/default/wiki/personal/reflections/foo.md'));
+    });
+  });
+
+  test('leaves default-source slugs unchanged without a matching source prefix', () => {
+    withTempBrainDir((dir) => {
+      writeFileSync(join(dir, '.gbrain-source'), 'wiki\n', 'utf8');
+      expect(resolveDreamReverseWriteSlug(dir, 'personal/reflections/foo', 'default'))
+        .toBe('personal/reflections/foo');
+      expect(resolveDreamReverseWriteFilePath(dir, 'personal/reflections/foo', 'default'))
+        .toBe(join(dir, '.sources/default/personal/reflections/foo.md'));
+    });
+  });
+
+  test('writes the active non-default source directly into its checkout root', () => {
+    withTempBrainDir((dir) => {
+      writeFileSync(join(dir, '.gbrain-source'), 'wiki\n', 'utf8');
+      expect(resolveDreamReverseWriteSlug(dir, 'personal/reflections/foo', 'wiki'))
+        .toBe('personal/reflections/foo');
+      expect(resolveDreamReverseWriteFilePath(dir, 'personal/reflections/foo', 'wiki'))
+        .toBe(join(dir, 'personal/reflections/foo.md'));
+    });
+  });
+
+  test('uses explicit checkout source for temporary worktrees without a dotfile', () => {
+    withTempBrainDir((dir) => {
+      expect(resolveDreamReverseWriteFilePath(
+        dir,
+        'personal/reflections/foo',
+        'wiki',
+        'wiki',
+      )).toBe(join(dir, 'personal/reflections/foo.md'));
+    });
+  });
+
+  test('preserves other non-default source isolation under .sources', () => {
+    withTempBrainDir((dir) => {
+      writeFileSync(join(dir, '.gbrain-source'), 'wiki\n', 'utf8');
+      expect(resolveDreamReverseWriteFilePath(dir, 'wiki/personal/reflections/foo', 'team'))
+        .toBe(join(dir, '.sources/team/wiki/personal/reflections/foo.md'));
+    });
+  });
+
+  test('does not normalize active-source-looking links from a default-source row', () => {
+    withTempBrainDir((dir) => {
+      writeFileSync(join(dir, '.gbrain-source'), 'wiki\n', 'utf8');
+      const md = [
+        'Links: [[wiki/personal/reflections/foo|Foo]] and [[wiki/originals/ideas/bar]].',
+        'Markdown: [Foo](wiki/personal/reflections/foo) and [Bar](wiki/originals/ideas/bar#anchor).',
+      ].join('\n');
+      expect(normalizeDreamReverseWriteMarkdown(dir, md, 'default')).toBe(md);
+    });
+  });
+
+  test('strips source-looking wikilinks for the active non-default source', () => {
+    withTempBrainDir((dir) => {
+      writeFileSync(join(dir, '.gbrain-source'), 'wiki\n', 'utf8');
+      const md = 'Links: [[wiki/personal/reflections/foo|Foo]] and [Foo](wiki/personal/reflections/foo).';
+      expect(normalizeDreamReverseWriteMarkdown(dir, md, 'wiki')).toBe(
+        'Links: [[personal/reflections/foo|Foo]] and [Foo](personal/reflections/foo).',
+      );
+    });
+  });
+
+  test('does not strip source-looking wikilinks for another non-default source', () => {
+    withTempBrainDir((dir) => {
+      writeFileSync(join(dir, '.gbrain-source'), 'wiki\n', 'utf8');
+      const md = 'Links: [[wiki/personal/reflections/foo|Foo]] and [Foo](wiki/personal/reflections/foo).';
+      expect(normalizeDreamReverseWriteMarkdown(dir, md, 'team')).toBe(md);
+    });
   });
 });
 

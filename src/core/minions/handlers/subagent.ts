@@ -461,9 +461,10 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       engine,
       config,
       brainId: data.brain_id,
-      allowedSlugPrefixes: data.allowed_slug_prefixes,
-      // #1586: cycle-resolved source scope for tool-call OperationContexts.
       sourceId: data.source_id,
+      allowedSlugPrefixes: data.allowed_slug_prefixes,
+      deferWriteThrough: data.defer_write_through,
+      dreamGenerated: data.dream_generated,
     });
     const toolDefs = data.allowed_tools && data.allowed_tools.length > 0
       ? filterAllowedTools(registry, data.allowed_tools)
@@ -530,6 +531,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           allowedSlugPrefixes: data.allowed_slug_prefixes,
           sourceId: data.source_id,
           deferEmbeds: true,
+          deferWriteThrough: data.defer_write_through,
+          dreamGenerated: data.dream_generated,
         });
         // Honor allowed_tools EXACTLY like the loop registry — a submitter
         // that scoped its job read-only must not gain write capability by

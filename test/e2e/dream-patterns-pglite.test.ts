@@ -24,7 +24,10 @@
 
 import { describe, test, expect } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
-import { runPhasePatterns } from '../../src/core/cycle/patterns.ts';
+import {
+  runPhasePatterns,
+  toSourceRelativePatternPrefix,
+} from '../../src/core/cycle/patterns.ts';
 import { withoutAnthropicKey } from '../helpers/no-anthropic-key.ts';
 
 interface TestRig {
@@ -141,6 +144,27 @@ describe('E2E patterns — disabled', () => {
 });
 
 describe('E2E patterns — insufficient_evidence', () => {
+  test('normalizes legacy source-prefixed config without leaking default-source rows', async () => {
+    expect(toSourceRelativePatternPrefix('wiki/personal/reflections', 'wiki'))
+      .toBe('personal/reflections');
+    expect(toSourceRelativePatternPrefix('wiki/personal/patterns', 'wiki'))
+      .toBe('personal/patterns');
+
+    const rig = await setupRig();
+    try {
+      await seedReflections(rig.engine, 5); // legacy rows live under source_id=default
+      const result = await runPhasePatterns(rig.engine, {
+        brainDir: rig.brainDir,
+        dryRun: false,
+        sourceId: 'wiki',
+      });
+      expect(result.status).toBe('skipped');
+      expect((result.details as { reason?: string }).reason).toBe('insufficient_evidence');
+    } finally {
+      await rig.cleanup();
+    }
+  }, 30_000);
+
   test('skipped with 0 reflections', async () => {
     const rig = await setupRig();
     try {

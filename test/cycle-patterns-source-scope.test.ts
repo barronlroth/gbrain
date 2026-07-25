@@ -99,13 +99,15 @@ describe('#1586: the patterns phase scopes its writes to the cycle source', () =
     expect(existsSync(join(brainDir, '.sources', SOURCE_ID, `${SLUG}.md`))).toBe(false);
   });
 
-  test('a foreign source still lands under .sources/<id>/', async () => {
+  test('a foreign source cannot write into the active checkout', async () => {
     const foreignDir = mkdtempSync(join(tmpdir(), 'gbrain-patterns-foreign-'));
     try {
       const refs = await collectChildPutPageSlugs(engine as any, [2001], SOURCE_ID);
-      // brainDir belongs to 'default' here, so 'coast' is foreign to it.
-      await reverseWriteRefs(engine as any, foreignDir, refs, 'default');
-      expect(existsSync(join(foreignDir, '.sources', SOURCE_ID, `${SLUG}.md`))).toBe(true);
+      // foreignDir belongs to 'default' here, so 'coast' is foreign to it.
+      // Dream finalization owns only the active checkout and must skip the row
+      // rather than materialising it below .sources/<id>/.
+      expect(await reverseWriteRefs(engine as any, foreignDir, refs, 'default')).toBe(0);
+      expect(existsSync(join(foreignDir, '.sources', SOURCE_ID, `${SLUG}.md`))).toBe(false);
       expect(existsSync(join(foreignDir, `${SLUG}.md`))).toBe(false);
     } finally {
       rmSync(foreignDir, { recursive: true, force: true });
