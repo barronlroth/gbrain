@@ -251,9 +251,11 @@ const FREE_LOCAL_EMBED_PROVIDERS: ReadonlySet<string> = new Set([
  * `litellm` is excluded on purpose, matching the embed set: a LiteLLM proxy can
  * front a paid provider, so pricing-unknown is the honest state there.
  */
-const FREE_LOCAL_CHAT_PROVIDERS: ReadonlySet<string> = new Set([
+const ZERO_MARGINAL_COST_CHAT_PROVIDERS: ReadonlySet<string> = new Set([
   'ollama',
   'llama-server',
+  // ChatGPT subscription-backed Codex OAuth has no per-token marginal bill.
+  'openai-codex',
 ]);
 
 /**
@@ -325,7 +327,7 @@ function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
   // Local-inference chat providers cost electricity, not tokens. Checked AFTER
   // the canonical table so an explicitly-priced local entry, should one ever be
   // added, still wins over the blanket zero.
-  if (kind === 'chat' && providerId && FREE_LOCAL_CHAT_PROVIDERS.has(providerId)) {
+  if (kind === 'chat' && providerId && ZERO_MARGINAL_COST_CHAT_PROVIDERS.has(providerId)) {
     return { input: 0, output: 0 };
   }
   return null;

@@ -7,6 +7,7 @@
 
 import type { Recipe } from '../types.ts';
 import { openai } from './openai.ts';
+import { openaiCodex } from './openai-codex.ts';
 import { google } from './google.ts';
 import { anthropic } from './anthropic.ts';
 import { claudeCli } from './claude-cli.ts';
@@ -33,6 +34,7 @@ import { perplexity } from './perplexity.ts';
 
 const ALL: Recipe[] = [
   openai,
+  openaiCodex,
   google,
   anthropic,
   claudeCli,

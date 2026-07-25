@@ -22,6 +22,7 @@ export type Implementation =
   | 'native-openai'
   | 'native-google'
   | 'native-anthropic'
+  | 'openai-codex'
   | 'openai-compatible'
   | 'claude-cli';
 

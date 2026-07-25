@@ -205,6 +205,17 @@ describe('BudgetTracker.reserve', () => {
     ]);
   });
 
+  test('subscription-backed Codex OAuth is priceable at zero marginal cost', () => {
+    const t = new BudgetTracker({ maxCostUsd: 0.0001, label: 'test', auditPath });
+    expect(() => t.reserve({
+      modelId: 'openai-codex:gpt-5.6-sol',
+      estimatedInputTokens: 100_000,
+      maxOutputTokens: 10_000,
+      kind: 'chat',
+    })).not.toThrow();
+    expect(t.totalSpent).toBe(0);
+  });
+
   test('no cap + unknown pricing: warns once per process, no throw', () => {
     const t = new BudgetTracker({ label: 'test', auditPath });
     expect(() =>
