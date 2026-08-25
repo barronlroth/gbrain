@@ -64,6 +64,7 @@ import { loadConfig } from '../config.ts';
 import type { GBrainConfig } from '../config.ts';
 import { mergedProviderEnv } from './provider-env.ts';
 import { buildGatewayConfig, foldNativeBaseUrlsFromFilePlane } from './build-gateway-config.ts';
+import { hasUsableCodexOAuthAccessToken } from './codex-oauth.ts';
 
 // ---- Gateway-wide AI-HTTP timeout (v0.42.20.0, #1762/#1775) ----
 //
@@ -1042,6 +1043,10 @@ export function isAvailable(touchpoint: TouchpointKind, modelOverride?: string):
     // embedding from an anthropic-configured brain is unavailable regardless of auth.
     const touchpointConfig = recipe.touchpoints[touchpoint as 'expansion' | 'chat' | 'reranker'];
     if (!touchpointConfig) return false;
+
+    if (recipe.implementation === 'openai-codex') {
+      return hasUsableCodexOAuthAccessToken(_config.env);
+    }
 
     // For openai-compatible without auth requirements (Ollama local), treat as always-available.
     const required = recipe.auth_env?.required ?? [];
@@ -3487,6 +3492,15 @@ export function probeChatModel(modelStr: string): ChatModelProbe {
       ok: false,
       reason: 'unavailable',
       detail: 'no Anthropic API key configured (set ANTHROPIC_API_KEY or run: gbrain config set anthropic_api_key ...)',
+    };
+  }
+  if (v.recipe.implementation === 'openai-codex'
+    && !hasUsableCodexOAuthAccessToken(_config?.env ?? process.env)) {
+    return {
+      ok: false,
+      reason: 'unavailable',
+      detail: 'no usable OpenAI Codex OAuth access token found in Hermes auth state',
+      fix: 'Run `hermes auth add openai-codex`.',
     };
   }
   return { ok: true };

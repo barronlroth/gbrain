@@ -5,9 +5,16 @@ import { tmpdir } from 'node:os';
 
 import {
   createCodexResponsesFetch,
+  hasUsableCodexOAuthAccessToken,
   resolveCodexOAuthAccessToken,
 } from '../../../src/core/ai/codex-oauth.ts';
 import { openaiCodex } from '../../../src/core/ai/recipes/openai-codex.ts';
+import {
+  configureGateway,
+  isAvailable,
+  probeChatModel,
+  resetGateway,
+} from '../../../src/core/ai/gateway.ts';
 
 function jwt(claims: Record<string, unknown>): string {
   const enc = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString('base64url');
@@ -20,6 +27,13 @@ function writeHermesToken(dir: string, accessToken: string): void {
     credential_pool: {
       'openai-codex': [{ source: 'manual:device_code', access_token: accessToken }],
     },
+  }));
+}
+
+function writeHermesPool(dir: string, entries: Array<Record<string, unknown>>): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'auth.json'), JSON.stringify({
+    credential_pool: { 'openai-codex': entries },
   }));
 }
 
@@ -102,6 +116,84 @@ describe('openai-codex OAuth fetch wrapper', () => {
         HERMES_PROFILE: 'work',
       })).toBe(usableGlobal);
     } finally {
+      rmSync(hermesDir, { recursive: true, force: true });
+    }
+  });
+
+  test('readiness uses the same Hermes credential-pool semantics as request-time auth', () => {
+    const hermesDir = mkdtempSync(join(tmpdir(), 'gbrain-codex-readiness-'));
+    const profileDir = join(hermesDir, 'profiles', 'work');
+    const now = Math.floor(Date.now() / 1000);
+    const usable = jwt({ exp: now + 3600 });
+    const expiringAtSkew = jwt({ exp: now + 120 });
+    try {
+      expect(hasUsableCodexOAuthAccessToken({ HERMES_HOME: hermesDir })).toBe(false);
+
+      writeHermesPool(hermesDir, [{ access_token: expiringAtSkew }]);
+      expect(hasUsableCodexOAuthAccessToken({ HERMES_HOME: hermesDir })).toBe(false);
+
+      writeHermesPool(hermesDir, [{ access_token: usable, last_status: 'dead' }]);
+      expect(hasUsableCodexOAuthAccessToken({ HERMES_HOME: hermesDir })).toBe(false);
+
+      writeHermesPool(hermesDir, [{ access_token: usable, last_status: 'exhausted' }]);
+      expect(hasUsableCodexOAuthAccessToken({ HERMES_HOME: hermesDir })).toBe(false);
+
+      writeHermesPool(hermesDir, [{
+        access_token: usable,
+        last_status: 'exhausted',
+        last_error_reset_at: now + 3600,
+      }]);
+      expect(hasUsableCodexOAuthAccessToken({ HERMES_HOME: hermesDir })).toBe(false);
+
+      writeHermesPool(hermesDir, [{
+        access_token: usable,
+        last_status: 'exhausted',
+        last_error_reset_at: now - 1,
+      }]);
+      expect(hasUsableCodexOAuthAccessToken({ HERMES_HOME: hermesDir })).toBe(true);
+
+      writeHermesPool(hermesDir, [{ access_token: usable }]);
+      mkdirSync(profileDir, { recursive: true });
+      writeHermesPool(profileDir, [{ access_token: usable, last_status: 'dead' }]);
+      expect(hasUsableCodexOAuthAccessToken({
+        HERMES_HOME: hermesDir,
+        HERMES_PROFILE: 'work',
+      })).toBe(false);
+
+      writeHermesPool(profileDir, []);
+      expect(hasUsableCodexOAuthAccessToken({
+        HERMES_HOME: hermesDir,
+        HERMES_PROFILE: 'work',
+      })).toBe(true);
+
+      writeHermesPool(profileDir, [{ access_token: usable }]);
+      expect(hasUsableCodexOAuthAccessToken({
+        HERMES_HOME: hermesDir,
+        HERMES_PROFILE: 'work',
+      })).toBe(true);
+    } finally {
+      rmSync(hermesDir, { recursive: true, force: true });
+    }
+  });
+
+  test('gateway availability and chat probe fail closed when Codex OAuth is unusable', () => {
+    const hermesDir = mkdtempSync(join(tmpdir(), 'gbrain-codex-gateway-readiness-'));
+    try {
+      configureGateway({
+        chat_model: 'openai-codex:gpt-5.6-terra',
+        env: { HERMES_HOME: hermesDir },
+      });
+      expect(isAvailable('chat')).toBe(false);
+      expect(probeChatModel('openai-codex:gpt-5.6-terra')).toMatchObject({
+        ok: false,
+        reason: 'unavailable',
+      });
+
+      writeHermesToken(hermesDir, jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }));
+      expect(isAvailable('chat')).toBe(true);
+      expect(probeChatModel('openai-codex:gpt-5.6-terra')).toEqual({ ok: true });
+    } finally {
+      resetGateway();
       rmSync(hermesDir, { recursive: true, force: true });
     }
   });

@@ -110,6 +110,15 @@ function loadUsableCodexTokens(env: Env): TokenSet | null {
   return null;
 }
 
+/**
+ * Read-only readiness check for the Hermes-owned Codex OAuth pool.
+ * Uses the exact same profile shadowing, status, reset, and expiry rules as
+ * request-time token resolution, but never refreshes or mutates credentials.
+ */
+export function hasUsableCodexOAuthAccessToken(env: Env): boolean {
+  return loadUsableCodexTokens(env) !== null;
+}
+
 export async function resolveCodexOAuthAccessToken(env: Env): Promise<string> {
   const tokens = loadUsableCodexTokens(env);
   if (!tokens) {
