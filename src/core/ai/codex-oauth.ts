@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 
 import { AIConfigError, AITransientError } from './errors.ts';
+import { VERSION } from '../../version.ts';
 
 const DEFAULT_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
 const CODEX_ACCESS_TOKEN_EXPIRY_SKEW_SECONDS = 120;
@@ -20,7 +21,14 @@ export function resolveCodexBaseURL(env: Env): string {
 }
 
 function hermesAuthPaths(env: Env): { profilePath?: string; globalPath: string } {
-  const hermesHome = (env.HERMES_HOME ?? '').trim() || join(homedir(), '.hermes');
+  const explicitHome = (env.HERMES_HOME ?? '').trim();
+  if (explicitHome) {
+    // Hermes exports HERMES_HOME as the exact active profile directory. Do
+    // not append profiles/$HERMES_PROFILE here or a profile-scoped process
+    // resolves .../profiles/work/profiles/work/auth.json.
+    return { globalPath: join(explicitHome, 'auth.json') };
+  }
+  const hermesHome = join(homedir(), '.hermes');
   const profile = (env.HERMES_PROFILE ?? '').trim();
   return {
     ...(profile && profile !== 'default'
@@ -130,7 +138,18 @@ export async function resolveCodexOAuthAccessToken(env: Env): Promise<string> {
   return tokens.access_token;
 }
 
-function codexHeaders(token: string, source?: HeadersInit): Headers {
+function isOfficialCodexBaseUrl(baseUrl: string): boolean {
+  try {
+    const url = new URL(baseUrl);
+    return url.protocol === 'https:'
+      && url.hostname === 'chatgpt.com'
+      && url.pathname.replace(/\/$/, '') === '/backend-api/codex';
+  } catch {
+    return false;
+  }
+}
+
+function codexHeaders(token: string, baseUrl: string, source?: HeadersInit): Headers {
   const headers = new Headers(source);
   headers.delete('content-length');
   headers.set('content-type', 'application/json');
@@ -138,6 +157,10 @@ function codexHeaders(token: string, source?: HeadersInit): Headers {
   headers.set('authorization', `Bearer ${token}`);
   headers.set('originator', 'codex_cli_rs');
   headers.set('user-agent', 'codex_cli_rs/0.0.0 (GBrain)');
+  if (isOfficialCodexBaseUrl(baseUrl)) {
+    headers.set('originator', 'hermes-agent');
+    headers.set('user-agent', `HermesAgent/${VERSION}`);
+  }
   const accountId = decodeJwtPayload(token)?.['https://api.openai.com/auth']?.chatgpt_account_id;
   if (typeof accountId === 'string' && accountId) {
     headers.set('ChatGPT-Account-ID', accountId);
@@ -260,8 +283,8 @@ export function createCodexResponsesFetch(env: Env): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const original = input instanceof Request ? input : new Request(input, init);
     const token = await resolveCodexOAuthAccessToken(env);
-    const headers = codexHeaders(token, original.headers);
     const url = new URL(original.url);
+    const headers = codexHeaders(token, resolveCodexBaseURL(env), original.headers);
 
     if (!url.pathname.endsWith('/responses')) {
       return fetch(original, { headers, signal: init?.signal ?? original.signal });

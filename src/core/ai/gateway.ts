@@ -3909,14 +3909,14 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     // own `providerOptions`) instead of a bare string.
     providerOptions.anthropic = { cacheControl: { type: 'ephemeral' } };
   }
-  // OpenAI prompt_cache_key (native-openai only): a stable per-prefix routing
+  // OpenAI prompt_cache_key (native OpenAI transports): a stable per-prefix routing
   // hint that keeps requests sharing a system prompt + tool set on the same
   // inference engine, lifting OpenAI's automatic prefix-cache hit rate. The
   // openai-compatible path (litellm/azure/groq/...) ignores
   // providerOptions.openai, so it gets nothing. Applied BEFORE the configured
   // provider options so `provider_chat_options.openai.promptCacheKey` from
   // config still overrides the derived key.
-  if (recipe.implementation === 'native-openai') {
+  if (recipe.implementation === 'native-openai' || recipe.implementation === 'openai-codex') {
     const promptCacheKey = openAIPromptCacheKey({
       system: opts.system,
       toolNames: (opts.tools ?? []).map(t => t.name),

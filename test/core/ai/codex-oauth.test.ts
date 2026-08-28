@@ -50,7 +50,10 @@ describe('openai-codex OAuth fetch wrapper', () => {
   test('is a chat-only provider without a false recipe-wide context cap', () => {
     expect(openaiCodex.implementation).toBe('openai-codex');
     expect(openaiCodex.touchpoints.expansion).toBeUndefined();
-    expect(openaiCodex.touchpoints.chat?.models).toContain('gpt-5.6-luna-pro');
+    expect(openaiCodex.touchpoints.chat?.models).toContain('gpt-5.6-luna');
+    expect(openaiCodex.touchpoints.chat?.models).not.toContain('gpt-5.6-luna-pro');
+    expect(openaiCodex.touchpoints.chat?.models).not.toContain('gpt-5.6-sol-pro');
+    expect(openaiCodex.touchpoints.chat?.models).not.toContain('gpt-5.6-terra-pro');
     expect(openaiCodex.touchpoints.chat?.models).toContain('gpt-5.3-codex');
     expect(openaiCodex.touchpoints.chat?.models).not.toContain('gpt-5.5-codex');
     expect(openaiCodex.touchpoints.chat?.max_context_tokens).toBeUndefined();
@@ -74,49 +77,54 @@ describe('openai-codex OAuth fetch wrapper', () => {
     }
   });
 
-  test('profile entries shadow global credentials and dead or cooling entries stay unavailable', async () => {
-    const hermesDir = mkdtempSync(join(tmpdir(), 'gbrain-profile-auth-'));
-    const profileDir = join(hermesDir, 'profiles', 'work');
-    const usableGlobal = jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+  test('exact active profile keeps dead or cooling credentials unavailable', async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'gbrain-profile-auth-'));
+    const profileDir = join(rootDir, 'profiles', 'work');
+    const usable = jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
     try {
-      writeHermesToken(hermesDir, usableGlobal);
-      mkdirSync(profileDir, { recursive: true });
-      writeFileSync(join(profileDir, 'auth.json'), JSON.stringify({
-        credential_pool: {
-          'openai-codex': [{
-            source: 'manual:dead',
-            access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }),
-            last_status: 'dead',
-          }],
-        },
-      }));
+      writeHermesPool(profileDir, [{
+        source: 'manual:dead',
+        access_token: usable,
+        last_status: 'dead',
+      }]);
       await expect(resolveCodexOAuthAccessToken({
-        HERMES_HOME: hermesDir,
+        HERMES_HOME: profileDir,
         HERMES_PROFILE: 'work',
       })).rejects.toThrow(/No usable/);
 
-      writeFileSync(join(profileDir, 'auth.json'), JSON.stringify({
-        credential_pool: {
-          'openai-codex': [{
-            source: 'manual:cooldown',
-            access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }),
-            last_status: 'exhausted',
-            last_error_reset_at: Math.floor(Date.now() / 1000) + 3600,
-          }],
-        },
-      }));
+      writeHermesPool(profileDir, [{
+        source: 'manual:cooldown',
+        access_token: usable,
+        last_status: 'exhausted',
+        last_error_reset_at: Math.floor(Date.now() / 1000) + 3600,
+      }]);
       await expect(resolveCodexOAuthAccessToken({
-        HERMES_HOME: hermesDir,
+        HERMES_HOME: profileDir,
         HERMES_PROFILE: 'work',
       })).rejects.toThrow(/No usable/);
 
-      writeFileSync(join(profileDir, 'auth.json'), JSON.stringify({ credential_pool: {} }));
+      writeHermesPool(profileDir, [{ access_token: usable }]);
       expect(await resolveCodexOAuthAccessToken({
-        HERMES_HOME: hermesDir,
+        HERMES_HOME: profileDir,
         HERMES_PROFILE: 'work',
-      })).toBe(usableGlobal);
+      })).toBe(usable);
     } finally {
-      rmSync(hermesDir, { recursive: true, force: true });
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  test('treats HERMES_HOME as the exact active profile directory', async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'gbrain-profile-root-'));
+    const profileDir = join(rootDir, 'profiles', 'work');
+    const usable = jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+    try {
+      writeHermesToken(profileDir, usable);
+      expect(await resolveCodexOAuthAccessToken({
+        HERMES_HOME: profileDir,
+        HERMES_PROFILE: 'work',
+      })).toBe(usable);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
     }
   });
 
@@ -152,23 +160,21 @@ describe('openai-codex OAuth fetch wrapper', () => {
       }]);
       expect(hasUsableCodexOAuthAccessToken({ HERMES_HOME: hermesDir })).toBe(true);
 
-      writeHermesPool(hermesDir, [{ access_token: usable }]);
-      mkdirSync(profileDir, { recursive: true });
       writeHermesPool(profileDir, [{ access_token: usable, last_status: 'dead' }]);
       expect(hasUsableCodexOAuthAccessToken({
-        HERMES_HOME: hermesDir,
+        HERMES_HOME: profileDir,
         HERMES_PROFILE: 'work',
       })).toBe(false);
 
       writeHermesPool(profileDir, []);
       expect(hasUsableCodexOAuthAccessToken({
-        HERMES_HOME: hermesDir,
+        HERMES_HOME: profileDir,
         HERMES_PROFILE: 'work',
-      })).toBe(true);
+      })).toBe(false);
 
       writeHermesPool(profileDir, [{ access_token: usable }]);
       expect(hasUsableCodexOAuthAccessToken({
-        HERMES_HOME: hermesDir,
+        HERMES_HOME: profileDir,
         HERMES_PROFILE: 'work',
       })).toBe(true);
     } finally {
@@ -236,8 +242,8 @@ describe('openai-codex OAuth fetch wrapper', () => {
         );
         const json = await response.json() as Record<string, any>;
         expect(capturedHeaders.get('authorization')).toMatch(/^Bearer /);
-        expect(capturedHeaders.get('originator')).toBe('codex_cli_rs');
-        expect(capturedHeaders.get('user-agent')).toMatch(/^codex_cli_rs/);
+        expect(capturedHeaders.get('originator')).toBe('hermes-agent');
+        expect(capturedHeaders.get('user-agent')).toMatch(/^HermesAgent\//);
         expect(capturedHeaders.get('chatgpt-account-id')).toBe('acct_test');
         expect(capturedBody.stream).toBe(true);
         expect(capturedBody.store).toBe(false);
@@ -251,6 +257,29 @@ describe('openai-codex OAuth fetch wrapper', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test('retains compatibility identity for custom Codex proxy endpoints', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-codex-proxy-'));
+    try {
+      writeHermesToken(dir, jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }));
+      const priorFetch = globalThis.fetch;
+      let capturedHeaders = new Headers();
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        capturedHeaders = new Headers(init?.headers);
+        return new Response(completedSse(), { status: 200 });
+      }) as unknown as typeof fetch;
+      try {
+        await createCodexResponsesFetch({
+          HERMES_HOME: dir,
+          HERMES_CODEX_BASE_URL: 'https://proxy.example/codex',
+        })('https://proxy.example/codex/responses', {
+          method: 'POST', body: JSON.stringify({ input: [] }),
+        });
+        expect(capturedHeaders.get('originator')).toBe('codex_cli_rs');
+        expect(capturedHeaders.get('user-agent')).toMatch(/^codex_cli_rs/);
+      } finally { globalThis.fetch = priorFetch; }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('assembles text deltas when no output_item.done arrives', async () => {

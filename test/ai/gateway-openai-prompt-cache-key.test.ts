@@ -5,14 +5,14 @@
  * OpenAI caches prompt prefixes automatically; a stable `prompt_cache_key`
  * keeps requests that share a prefix on the same inference engine, lifting the
  * automatic-cache hit rate. `chat()` derives one from the system prompt + tool
- * names for native-OpenAI models and passes it via
+ * names for native OpenAI transports and passes it via
  * `providerOptions.openai.promptCacheKey` (which @ai-sdk/openai maps to the
  * request's `prompt_cache_key`).
  *
  * Pins:
  *   - key derivation is stable (tool ORDER doesn't matter), sensitive to
  *     system/tool-set changes, and absent without a system prompt
- *   - the chat() wiring only fires for native-openai (anthropic/compat get
+ *   - the chat() wiring fires for native-openai and openai-codex (anthropic/compat get
  *     nothing), and config `provider_chat_options` overrides the derived key
  */
 
@@ -91,6 +91,14 @@ describe('chat() wiring — prompt_cache_key per provider', () => {
       { chat_model: 'openai:gpt-4o-mini', env: { OPENAI_API_KEY: 'fake' } },
     );
     expect(providerOptions).toBeUndefined();
+  });
+
+  test('openai-codex receives the same production prompt cache routing key', async () => {
+    const providerOptions = await captureProviderOptions(
+      { chat_model: 'openai-codex:gpt-5.6-terra', env: {} },
+      { system: 'SYS' },
+    );
+    expect(providerOptions?.openai?.promptCacheKey).toMatch(/^gbrain:[0-9a-f]{32}$/);
   });
 
   test('native-anthropic never gets an openai promptCacheKey', async () => {
