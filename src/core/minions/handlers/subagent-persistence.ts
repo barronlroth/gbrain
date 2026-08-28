@@ -11,6 +11,7 @@
 import type { BrainEngine } from '../../engine.ts';
 import type { ContentBlock, SubagentResult } from '../types.ts';
 import { UnrecoverableError } from '../types.ts';
+import { normalizeToolOutput } from '../../ai/tool-output.ts';
 
 export interface PersistedMessage {
   message_idx: number;
@@ -214,7 +215,7 @@ export async function persistToolExecComplete(
          ORDER BY CASE WHEN ordinal = $5 THEN 0 ELSE 1 END, id
          LIMIT 1
       )`,
-    [jobId, messageIdx, toolUseId, typeof output === 'string' ? output : JSON.stringify(output), ordinal],
+    [jobId, messageIdx, toolUseId, JSON.stringify(normalizeToolOutput(output)), ordinal],
   );
 }
 

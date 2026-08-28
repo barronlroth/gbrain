@@ -24,6 +24,8 @@
 import { embed as aiEmbed, embedMany, generateObject, generateText, jsonSchema } from 'ai';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
+import { normalizeToolOutput } from './tool-output.ts';
+export { normalizeToolOutput } from './tool-output.ts';
 import { listRecipes } from './recipes/index.ts';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -3179,45 +3181,6 @@ function defaultMaxOutputTokens(modelStr: string | undefined): number {
   return isThinkingByDefaultModel(modelStr)
     ? THINKING_MODEL_MAX_OUTPUT_TOKENS
     : DEFAULT_MAX_OUTPUT_TOKENS;
-}
-
-/**
- * Deep-serialize a tool output into a plain JSON value for the AI SDK v6
- * ModelMessage schema. Preserves useful fields while normalizing values that
- * strict JSON rejects: Date → ISO, BigInt → decimal string, non-finite numbers
- * → null, unsupported object properties → omitted, unsupported array entries
- * → null, and cycles → "[Circular]". The same conversion is used for durable
- * persistence and the SDK boundary so replay cannot diverge from live turns.
- * Apply this immediately after tool execution, before persistence callbacks
- * as well as at the SDK boundary, so crash replay sees the same safe shape.
- */
-export function normalizeToolOutput(value: unknown, seen = new WeakSet<object>()): unknown {
-  if (value === null) return null;
-  if (typeof value === 'string' || typeof value === 'boolean') return value;
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-  if (typeof value === 'bigint') return value.toString();
-  if (value === undefined || typeof value === 'function' || typeof value === 'symbol') return null;
-
-  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString();
-  if (typeof value !== 'object') return String(value);
-  if (seen.has(value)) return '[Circular]';
-  seen.add(value);
-
-  try {
-    if (Array.isArray(value)) {
-      return value.map(item => normalizeToolOutput(item, seen));
-    }
-    const out: Record<string, unknown> = {};
-    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-      if (nested === undefined || typeof nested === 'function' || typeof nested === 'symbol') continue;
-      out[key] = normalizeToolOutput(nested, seen);
-    }
-    return out;
-  } catch {
-    return String(value);
-  } finally {
-    seen.delete(value);
-  }
 }
 
 /** Stringify that never throws (bigint/circular fall back to String()). */

@@ -190,3 +190,31 @@ describe('persistToolExec* — legacy ordinal=NULL row compatibility', () => {
     expect((out as Record<string, unknown>)?.hit).toBe('original'); // untouched
   });
 });
+
+describe('persistToolExecComplete — JSON-safe durable output', () => {
+  test('normalizes BigInt, dates, non-finite values, unsupported fields, and cycles before JSONB persistence', async () => {
+    await persistToolExecPending(engine, jobId, 5, 0, 'json-safe', 'search', {});
+    const output: Record<string, unknown> = {
+      count: 42n,
+      at: new Date('2026-08-28T12:34:56.000Z'),
+      infinity: Number.POSITIVE_INFINITY,
+      omitted: undefined,
+      nested: [1n, undefined],
+    };
+    output.self = output;
+
+    await persistToolExecComplete(engine, jobId, 5, 0, 'json-safe', output);
+
+    const persisted = (await rows()).find(row => row.tool_use_id === 'json-safe');
+    const value = typeof persisted?.output === 'string'
+      ? JSON.parse(persisted.output)
+      : persisted?.output as Record<string, unknown>;
+    expect(value).toEqual({
+      count: '42',
+      at: '2026-08-28T12:34:56.000Z',
+      infinity: null,
+      nested: ['1', null],
+      self: '[Circular]',
+    });
+  });
+});

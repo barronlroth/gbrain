@@ -53,6 +53,7 @@ import { splitProviderModelId, normalizeModelId } from '../../model-id.ts';
 import { resolveAnthropicKey } from '../../ai/anthropic-key.ts';
 import { buildSystemPrompt, DEFAULT_SUBAGENT_SYSTEM } from '../system-prompt.ts';
 import { toolLoop as gatewayToolLoop, isThinkingByDefaultModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../../ai/gateway.ts';
+import { normalizeToolOutput } from '../../ai/tool-output.ts';
 import type { ChatToolDef, ChatMessage, ChatBlock, ChatResult, ToolHandler } from '../../ai/gateway.ts';
 import { classifyCapabilities } from '../../ai/capabilities.ts';
 import { runSubagentOneshot, ONESHOT_TOOL_USE_ID_PREFIX } from './subagent-oneshot.ts';
@@ -694,9 +695,9 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           }
           await persistToolExecPending(engine, ctx.id, last.message_idx, useOrdinal, use.id, use.name, use.input);
           try {
-            const output = await toolDef.execute(use.input, {
+            const output = normalizeToolOutput(await toolDef.execute(use.input, {
               engine, jobId: ctx.id, remote: true, signal: ctx.signal,
-            });
+            }));
             await persistToolExecComplete(engine, ctx.id, last.message_idx, useOrdinal, use.id, output);
             synthesizedResults.push({
               type: 'tool_result', tool_use_id: use.id,
@@ -1038,12 +1039,12 @@ export function makeSubagentHandler(deps: SubagentDeps) {
 
         const toolStart = Date.now();
         try {
-          const output = await toolDef.execute(use.input, {
+          const output = normalizeToolOutput(await toolDef.execute(use.input, {
             engine,
             jobId: ctx.id,
             remote: true,
             signal: ctx.signal,
-          });
+          }));
           await persistToolExecComplete(engine, ctx.id, assistantIdx, useOrdinal, use.id, output);
           logSubagentHeartbeat({
             job_id: ctx.id,
@@ -1625,7 +1626,7 @@ async function reconcileGatewayReplay(args: ReconcileArgs): Promise<ReconcileRes
       }
       await persistToolExecPending(engine, jobId, msg.message_idx, callIdx, call.toolCallId, call.toolName, call.input);
       try {
-        const output = await toolDef.execute(call.input, { engine, jobId, remote: true, signal });
+        const output = normalizeToolOutput(await toolDef.execute(call.input, { engine, jobId, remote: true, signal }));
         await persistToolExecComplete(engine, jobId, msg.message_idx, callIdx, call.toolCallId, output);
         results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output });
       } catch (e) {
@@ -1766,11 +1767,7 @@ function adaptContentBlocksToChatBlocks(blocks: unknown): ChatBlock[] | string {
 
 function asStringIfNotObject(value: unknown): string {
   if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
+  return JSON.stringify(normalizeToolOutput(value));
 }
 
 /**
