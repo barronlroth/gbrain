@@ -233,6 +233,30 @@ describe('queue-mode → drains successfully on happy path', () => {
     expect(Number(facts[0]?.n ?? 0)).toBe(1);
   });
 
+  test('short-lived PGLite inline absorption propagates cancellation', async () => {
+    chatStub([{ fact: 'must-not-land', kind: 'fact', notability: 'high', entity: null }]);
+    markShortLivedCliProcess();
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(runFactsBackstop(
+      {
+        slug: 'meetings/pglite-abort-' + Math.random().toString(36).slice(2, 8),
+        type: 'meeting',
+        compiled_truth: LONG_BODY,
+        frontmatter: {},
+      },
+      {
+        engine,
+        sourceId: 'default',
+        sessionId: 'pglite-abort-session',
+        source: 'sync:import',
+        mode: 'queue',
+        abortSignal: controller.signal,
+      },
+    )).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
   test('queue worker completes; counters reflect work done', async () => {
     chatStub([{ fact: 'queue-drain-test', kind: 'fact', notability: 'medium', entity: null }]);
 

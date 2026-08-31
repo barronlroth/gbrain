@@ -743,9 +743,9 @@ async function runPhaseSynthesizeInner(
       if (capActive && submittedToday + chunks.length > dailyCap) {
         const fileKeys = chunks.length > 1
           ? chunks.map((_, i) =>
-              `dream:synth-v2:${encodeURIComponent(opts.sourceId ?? 'default')}` +
+              `dream:synth-v2:${encodeURIComponent(activeSourceId)}` +
               `:filename:${encodeURIComponent(basename(t.filePath))}:${hash16}:c${i}of${chunks.length}`)
-          : [`dream:synth-v2:${encodeURIComponent(opts.sourceId ?? 'default')}` +
+          : [`dream:synth-v2:${encodeURIComponent(activeSourceId)}` +
               `:filename:${encodeURIComponent(basename(t.filePath))}:${hash16}`];
         let existingKeys = 0;
         try {
@@ -828,7 +828,7 @@ async function runPhaseSynthesizeInner(
         // complete filename remain explicit so equal bytes in different source
         // or filename namespaces do not collide.
         const synthesisKey =
-          `dream:synth-v2:${encodeURIComponent(opts.sourceId ?? 'default')}` +
+          `dream:synth-v2:${encodeURIComponent(activeSourceId)}` +
           `:filename:${encodeURIComponent(basename(t.filePath))}:${hash16}`;
         const idempotency_key = isChunked
           ? `${synthesisKey}:c${i}of${chunks.length}`
@@ -3005,7 +3005,6 @@ async function reverseWriteRefs(
       process.stderr.write(`[dream] reverse-write ${slug}@${source_id} skipped: not active source ${checkoutSourceId ?? '(unset)'}\n`);
       continue;
     }
-    throwIfAborted(signal, '[dream] synthesize reverse-write');
     const outputSlug = resolveDreamReverseWriteSlug(brainDir, slug, source_id, checkoutSourceId);
     const result = await writePageThrough(engine, slug, {
       sourceId: source_id,
@@ -3021,6 +3020,7 @@ async function reverseWriteRefs(
       ),
       logger: { warn: (message) => process.stderr.write(`[dream] ${message}\n`) },
     });
+    throwIfAborted(signal, '[dream] synthesize reverse-write');
     if (result.written) count++;
   }
   return count;

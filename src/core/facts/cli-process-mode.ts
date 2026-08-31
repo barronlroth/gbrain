@@ -10,9 +10,10 @@
  * teardown landed, and no facts ever extracted for those pages.
  *
  * Fix: cli.ts marks one-shot processes via markShortLivedCliProcess();
- * runFactsBackstop's queue mode checks isShortLivedCliProcess() and submits
- * a durable `facts-absorb` minion job (processed by the long-lived
- * `gbrain jobs work` daemon) instead of the doomed in-process enqueue.
+ * runFactsBackstop's queue mode checks isShortLivedCliProcess(). Postgres
+ * submits a durable `facts-absorb` minion job to its long-lived worker;
+ * PGLite runs synchronously in the lock-owning process because a second
+ * worker process cannot open the same data directory.
  *
  * A marker (not argv heuristics) so tests and embedded/server callers are
  * never affected: only cli.ts sets it, and never for daemon commands

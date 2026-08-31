@@ -234,7 +234,8 @@ describe('#4077 — synthesize/patterns cooperative-abort threading', () => {
     expect(src).toMatch(/waitForCompletionRenewing\(queue, jobId, \{[\s\S]*?signal: opts\.signal,/);
     // Write boundaries downstream of the drain are signal-guarded.
     expect(src).toContain('stampDreamProvenance(engine, writtenRefs, summaryDate, opts.signal)');
-    expect(src).toContain('reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal)');
+    expect(src).toMatch(/reverseWriteRefs\([\s\S]{0,240}?engine,[\s\S]{0,240}?opts\.brainDir,[\s\S]{0,240}?writtenRefs,[\s\S]{0,240}?activeSourceId,[\s\S]{0,240}?opts\.signal/);
+    expect(src).toContain("throwIfAborted(signal, '[dream] synthesize reverse-write')");
   });
 
   test('patterns sibling threads the same signal through inline drain, wait, and reverse-write', async () => {
@@ -243,6 +244,7 @@ describe('#4077 — synthesize/patterns cooperative-abort threading', () => {
     expect(src).toContain('signal?: AbortSignal');
     expect(src).toMatch(/runSubagentsInline\([\s\S]{0,240}?opts\.signal/);
     expect(src).toMatch(/waitForCompletionRenewing\(queue, job\.id, \{[\s\S]*?signal: opts\.signal,/);
-    expect(src).toContain('reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal)');
+    expect(src).toMatch(/reverseWriteRefs\([\s\S]{0,240}?engine,[\s\S]{0,240}?opts\.brainDir,[\s\S]{0,240}?writtenRefs,[\s\S]{0,240}?activeSourceId,[\s\S]{0,240}?opts\.signal/);
+    expect(src).toContain("throwIfAborted(signal, '[dream] patterns reverse-write')");
   });
 });

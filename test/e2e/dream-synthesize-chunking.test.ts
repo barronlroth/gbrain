@@ -377,6 +377,7 @@ describe('E2E synthesize chunking — fan-out shape', () => {
       await rig.engine.executeRaw(
         `INSERT INTO sources (id, name) VALUES ('wiki', 'Wiki') ON CONFLICT (id) DO NOTHING`,
       );
+      writeFileSync(join(rig.brainDir, '.gbrain-source'), 'wiki\n');
       // Default budget is plenty for 5KB content.
 
       const basename = '2026-04-25-small.txt';
@@ -390,7 +391,6 @@ describe('E2E synthesize chunking — fan-out shape', () => {
           const result = await runPhaseSynthesize(rig.engine, {
             brainDir: rig.brainDir,
             dryRun: false,
-            sourceId: 'wiki',
           });
           const details = result.details as { children_submitted: number };
           expect(details.children_submitted).toBe(1);

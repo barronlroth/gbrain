@@ -301,13 +301,16 @@ export async function runFactsBackstop(
       // Run synchronously in the owning CLI process instead. This is slower,
       // but PGLite's only correct execution path is single-process anyway.
       if (ctx.engine.kind === 'pglite') {
+        ctx.abortSignal?.throwIfAborted();
         const inlineModel = await availabilityGate();
         if (!inlineModel) {
           return { mode: 'queue', enqueued: false, queueDepth: 0, skipped: 'extraction_unavailable' };
         }
+        ctx.abortSignal?.throwIfAborted();
         try {
           await runPipeline(parsedPage, { ...ctx, model: inlineModel }, ctx.abortSignal);
         } catch (err) {
+          if (ctx.abortSignal?.aborted || (err instanceof Error && err.name === 'AbortError')) throw err;
           const { writeFactsAbsorbFailure } = await import('./absorb-log.ts');
           await writeFactsAbsorbFailure(ctx.engine, parsedPage.slug, err, ctx.sourceId);
         }

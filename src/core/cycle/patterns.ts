@@ -632,6 +632,7 @@ async function reverseWriteRefs(
       ),
       logger: { warn: (message) => process.stderr.write(`[dream] ${message}\n`) },
     });
+    throwIfAborted(signal, '[dream] patterns reverse-write');
     if (result.written) count++;
   }
   return count;

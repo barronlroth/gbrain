@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
 import { AIConfigError, AITransientError } from './errors.ts';
@@ -20,15 +20,35 @@ export function resolveCodexBaseURL(env: Env): string {
   return (env.HERMES_CODEX_BASE_URL ?? '').trim().replace(/\/$/, '') || DEFAULT_CODEX_BASE_URL;
 }
 
+function platformHermesRoot(env: Env): string {
+  if (process.platform === 'win32') {
+    const localAppData = (env.LOCALAPPDATA ?? '').trim();
+    return localAppData
+      ? join(localAppData, 'hermes')
+      : join((env.HOME ?? homedir()).trim() || homedir(), 'AppData', 'Local', 'hermes');
+  }
+  return join((env.HOME ?? homedir()).trim() || homedir(), '.hermes');
+}
+
 function hermesAuthPaths(env: Env): { profilePath?: string; globalPath: string } {
   const explicitHome = (env.HERMES_HOME ?? '').trim();
   if (explicitHome) {
     // Hermes exports HERMES_HOME as the exact active profile directory. Do
     // not append profiles/$HERMES_PROFILE here or a profile-scoped process
     // resolves .../profiles/work/profiles/work/auth.json.
-    return { globalPath: join(explicitHome, 'auth.json') };
+    const activeHome = resolve(explicitHome);
+    const parent = dirname(activeHome);
+    const globalHome = parent.endsWith(`${process.platform === 'win32' ? '\\' : '/'}profiles`)
+      ? dirname(parent)
+      : activeHome;
+    return globalHome === activeHome
+      ? { globalPath: join(activeHome, 'auth.json') }
+      : {
+          profilePath: join(activeHome, 'auth.json'),
+          globalPath: join(globalHome, 'auth.json'),
+        };
   }
-  const hermesHome = join(homedir(), '.hermes');
+  const hermesHome = platformHermesRoot(env);
   const profile = (env.HERMES_PROFILE ?? '').trim();
   return {
     ...(profile && profile !== 'default'
@@ -78,12 +98,39 @@ function providerPool(store: AuthStore | null): unknown[] {
   return Array.isArray(pool) ? pool : [];
 }
 
-function entryIsAvailable(entry: Record<string, unknown>): boolean {
+function parseAbsoluteTimestamp(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return value > 1_000_000_000_000 ? value / 1000 : value;
+  }
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric > 1_000_000_000_000 ? numeric / 1000 : numeric;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed / 1000 : null;
+}
+
+function exhaustedTtlSeconds(entry: Record<string, unknown>, soleCredential: boolean): number {
+  const code = typeof entry.last_error_code === 'number' ? entry.last_error_code : null;
+  const reason = typeof entry.failure_reason === 'string' ? entry.failure_reason : '';
+  if (code === 401) return 5 * 60;
+  const base = 60 * 60;
+  if (reason === 'billing_unverified' && code !== 402) return 60;
+  const billing = code === 402 || reason === 'billing';
+  return soleCredential && !billing ? 60 : base;
+}
+
+function entryIsAvailable(entry: Record<string, unknown>, soleCredential: boolean): boolean {
   const status = typeof entry.last_status === 'string' ? entry.last_status.toLowerCase() : '';
   if (status === 'dead') return false;
   if (status === 'exhausted') {
-    const resetAt = entry.last_error_reset_at;
-    if (typeof resetAt !== 'number' || resetAt > Date.now() / 1000) return false;
+    const resetAt = parseAbsoluteTimestamp(entry.last_error_reset_at);
+    const statusAt = parseAbsoluteTimestamp(entry.last_status_at);
+    const exhaustedUntil = resetAt ?? (statusAt === null
+      ? null
+      : statusAt + exhaustedTtlSeconds(entry, soleCredential));
+    if (exhaustedUntil !== null && exhaustedUntil > Date.now() / 1000) return false;
   }
   return true;
 }
@@ -98,11 +145,28 @@ function loadUsableCodexTokens(env: Env): TokenSet | null {
   // Match Hermes' provider-level shadowing: any profile entries make that
   // provider slice authoritative. Never bypass an exhausted/dead profile pool
   // by silently borrowing a global credential.
-  const candidates = profilePool.length > 0 ? profilePool : globalPool;
+  const candidates = (profilePool.length > 0 ? profilePool : globalPool)
+    .map((candidate, index) => ({ candidate, index }))
+    .sort((a, b) => {
+      const aPriority = a.candidate && typeof a.candidate === 'object'
+        && typeof (a.candidate as Record<string, unknown>).priority === 'number'
+        ? (a.candidate as Record<string, number>).priority
+        : 0;
+      const bPriority = b.candidate && typeof b.candidate === 'object'
+        && typeof (b.candidate as Record<string, unknown>).priority === 'number'
+        ? (b.candidate as Record<string, number>).priority
+        : 0;
+      return aPriority - bPriority || a.index - b.index;
+    })
+    .map(({ candidate }) => candidate);
+  const soleCredential = candidates.filter(candidate => {
+    if (!candidate || typeof candidate !== 'object') return false;
+    return String((candidate as Record<string, unknown>).last_status ?? '').toLowerCase() !== 'dead';
+  }).length <= 1;
   for (const candidate of candidates) {
     if (!candidate || typeof candidate !== 'object') continue;
     const entry = candidate as Record<string, unknown>;
-    if (!entryIsAvailable(entry)) continue;
+    if (!entryIsAvailable(entry, soleCredential)) continue;
     const tokens = asTokenSet(entry);
     if (tokens && !accessTokenIsExpiring(tokens.access_token)) return tokens;
   }
@@ -141,9 +205,11 @@ export async function resolveCodexOAuthAccessToken(env: Env): Promise<string> {
 function isOfficialCodexBaseUrl(baseUrl: string): boolean {
   try {
     const url = new URL(baseUrl);
+    const path = url.pathname.replace(/\/$/, '');
     return url.protocol === 'https:'
       && url.hostname === 'chatgpt.com'
-      && url.pathname.replace(/\/$/, '') === '/backend-api/codex';
+      && (url.port === '' || url.port === '443')
+      && (path === '/backend-api/codex' || path.startsWith('/backend-api/codex/'));
   } catch {
     return false;
   }
